@@ -13,6 +13,11 @@ pnpm dev
 - Web-App erreichbar unter [http://localhost:5173](http://localhost:5173)
 - API erreichbar unter [http://localhost:3000](http://localhost:3000)
 
+### API: `/levels/demo`
+- `GET http://localhost:3000/levels/demo`
+  - Liefert ein Demo-Level nach dem gemeinsamen Zod-Schema aus `@ir/game-spec`.
+  - Bei Validierungsfehlern sendet die API einen `500`-Status mit Fehlerinformationen.
+
 ### Web starten
 
 ```bash

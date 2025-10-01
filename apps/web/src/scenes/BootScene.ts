@@ -1,12 +1,11 @@
 import Phaser from 'phaser';
 
-const TEXTURES: Array<{ key: string; width: number; height: number; color: number }>
-  = [
-    { key: 'player', width: 48, height: 64, color: 0x38bdf8 },
-    { key: 'platform', width: 64, height: 16, color: 0x1e293b },
-    { key: 'hazard', width: 64, height: 16, color: 0xef4444 },
-    { key: 'exit', width: 32, height: 64, color: 0x22c55e },
-  ];
+const TEXTURES: Array<{ key: string; width: number; height: number; color: number }> = [
+  { key: 'player', width: 48, height: 64, color: 0x38bdf8 },
+  { key: 'platform', width: 64, height: 16, color: 0x1e293b },
+  { key: 'hazard', width: 64, height: 16, color: 0xef4444 },
+  { key: 'exit', width: 32, height: 64, color: 0x22c55e },
+];
 
 export class BootScene extends Phaser.Scene {
   constructor() {
