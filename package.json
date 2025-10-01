@@ -9,6 +9,7 @@
   ],
   "scripts": {
     "dev": "concurrently \"pnpm --filter web dev\" \"pnpm --filter api dev\"",
+    "playtester": "pnpm --filter @srv/playtester dev",
     "build": "pnpm -r run build",
     "lint": "pnpm -r run lint",
     "format": "pnpm -r run format"

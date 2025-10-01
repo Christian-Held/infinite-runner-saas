@@ -25,6 +25,7 @@ services:
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       REDIS_URL: redis://redis:6379
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-dev-internal}
     depends_on:
       - redis
     volumes:
@@ -38,6 +39,12 @@ services:
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       REDIS_URL: redis://redis:6379
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      GEN_MAX_ATTEMPTS: ${GEN_MAX_ATTEMPTS:-3}
+      GEN_SIMHASH_TTL_SEC: ${GEN_SIMHASH_TTL_SEC:-604800}
+      OPENAI_REQ_TIMEOUT_MS: ${OPENAI_REQ_TIMEOUT_MS:-20000}
+      API_BASE_URL: http://api:3000
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-dev-internal}
     depends_on:
       - redis
 
