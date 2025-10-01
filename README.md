@@ -13,6 +13,15 @@ pnpm dev
 - Web-App erreichbar unter [http://localhost:5173](http://localhost:5173)
 - API erreichbar unter [http://localhost:3000](http://localhost:3000)
 
+### Web starten
+
+```bash
+pnpm --filter web dev
+```
+
+- Steuerung: Links/Rechts über `A`/`D` oder Pfeiltasten, Sprung via `Leertaste` oder `Pfeil nach oben`, `Esc` pausiert.
+- Ziel: Laufe zum Ausgang, weiche Gefahren aus und erreiche das Levelende so schnell wie möglich.
+
 ## Docker-Entwicklung
 ```bash
 docker compose up --build
