@@ -11,6 +11,8 @@
     "format": "prettier --check \"src/**/*.ts\""
   },
   "dependencies": {
+    "@fastify/cors": "^8.4.2",
+    "@ir/game-spec": "workspace:^",
     "fastify": "^4.25.2"
   },
   "devDependencies": {
