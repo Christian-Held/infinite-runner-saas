@@ -1,11 +1,20 @@
 import cors from '@fastify/cors';
-import Fastify from 'fastify';
+import Fastify, { type FastifyRequest } from 'fastify';
 import pino from 'pino';
 import { ZodError, z } from 'zod';
 
 import { Ability, Level } from '@ir/game-spec';
 
-import { getJob, getLevel, isDbHealthy, listLevels, setPublished } from './db';
+import {
+  getJob,
+  getLevel,
+  insertJob,
+  insertLevel,
+  isDbHealthy,
+  listLevels,
+  setPublished,
+  updateJobStatus,
+} from './db';
 import type { QueueManager } from './queue';
 
 const PublishBodySchema = z.object({
@@ -25,6 +34,40 @@ const ListQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(50).optional(),
   offset: z.coerce.number().int().min(0).optional(),
 });
+
+const InternalLevelSchema = z.object({
+  level: Level,
+  meta: z.object({
+    difficulty: z.number().int().min(1),
+    seed: z.string(),
+  }),
+});
+
+const JobStatusSchema = z.enum(['queued', 'running', 'failed', 'succeeded']);
+
+const InternalJobCreateSchema = z.object({
+  id: z.string(),
+  type: z.enum(['gen', 'test']),
+  status: JobStatusSchema.default('queued'),
+  levelId: z.string().nullable().optional(),
+});
+
+const InternalJobUpdateSchema = z.object({
+  status: JobStatusSchema,
+  error: z.string().nullable().optional(),
+  levelId: z.string().optional(),
+});
+
+const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN ?? 'dev-internal';
+
+function assertInternal(request: FastifyRequest) {
+  const token = request.headers['x-internal-token'];
+  if (token !== INTERNAL_TOKEN) {
+    const error = new Error('Missing or invalid internal token');
+    (error as any).statusCode = 401;
+    throw error;
+  }
+}
 
 export interface ServerDependencies {
   queueManager: QueueManager;
@@ -59,6 +102,7 @@ export function createServer({ queueManager }: ServerDependencies) {
       status: 'ok',
       db: isDbHealthy(),
       redis: redisHealthy,
+      worker: false,
     };
   });
 
@@ -110,6 +154,29 @@ export function createServer({ queueManager }: ServerDependencies) {
       abilities: body.abilities,
     });
     return { jobId };
+  });
+
+  server.post('/internal/levels', async (request) => {
+    assertInternal(request);
+    const body = InternalLevelSchema.parse(request.body);
+    const level = Level.parse(body.level);
+    insertLevel(level, { difficulty: body.meta.difficulty, seed: body.meta.seed });
+    return { id: level.id };
+  });
+
+  server.post('/internal/jobs', async (request) => {
+    assertInternal(request);
+    const body = InternalJobCreateSchema.parse(request.body);
+    insertJob({ id: body.id, type: body.type, status: body.status, level_id: body.levelId ?? null });
+    return { id: body.id };
+  });
+
+  server.post('/internal/jobs/:id/status', async (request) => {
+    assertInternal(request);
+    const params = z.object({ id: z.string() }).parse(request.params);
+    const body = InternalJobUpdateSchema.parse(request.body);
+    updateJobStatus(params.id, body.status, { error: body.error ?? undefined, levelId: body.levelId });
+    return { id: params.id, status: body.status };
   });
 
   server.get('/jobs/:id', async (request, reply) => {
