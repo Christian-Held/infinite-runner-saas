@@ -50,9 +50,9 @@ interface JobRow {
   updated_at: number;
 }
 
-let dbInstance: Database.Database | null = null;
-
 const DEFAULT_DB_PATH = './data/app.db';
+
+let dbInstance: Database.Database | null = null;
 
 function resolveDbPath(dbPath: string): string {
   return path.isAbsolute(dbPath) ? dbPath : path.resolve(process.cwd(), dbPath);
@@ -65,22 +65,28 @@ function ensureDirectoryFor(filePath: string) {
   }
 }
 
-export function initDb(dbPath = process.env.DB_PATH ?? DEFAULT_DB_PATH): Database.Database {
-  const resolvedPath = resolveDbPath(dbPath);
-  ensureDirectoryFor(resolvedPath);
-
+export function openDb(): Database.Database {
   if (dbInstance) {
     return dbInstance;
   }
 
-  dbInstance = new Database(resolvedPath);
-  dbInstance.pragma('journal_mode = WAL');
-  return dbInstance;
+  const dbPath = process.env.DB_PATH ?? DEFAULT_DB_PATH;
+  const resolvedPath = resolveDbPath(dbPath);
+  ensureDirectoryFor(resolvedPath);
+
+  try {
+    dbInstance = new Database(resolvedPath);
+    dbInstance.pragma('journal_mode = WAL');
+    return dbInstance;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to open database at ${resolvedPath}: ${message}`);
+  }
 }
 
 export function getDb(): Database.Database {
   if (!dbInstance) {
-    throw new Error('Database not initialised. Call initDb() first.');
+    return openDb();
   }
   return dbInstance;
 }
@@ -90,43 +96,6 @@ export function closeDb() {
     dbInstance.close();
     dbInstance = null;
   }
-}
-
-export function migrate() {
-  const db = getDb();
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS levels (
-      id TEXT PRIMARY KEY,
-      seed TEXT NOT NULL,
-      rules_json TEXT NOT NULL,
-      tiles_json TEXT NOT NULL,
-      moving_json TEXT NOT NULL,
-      items_json TEXT NOT NULL,
-      enemies_json TEXT NOT NULL,
-      checkpoints_json TEXT NOT NULL,
-      exit_json TEXT NOT NULL,
-      difficulty INTEGER NOT NULL,
-      published INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-  `);
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS jobs (
-      id TEXT PRIMARY KEY,
-      type TEXT NOT NULL,
-      status TEXT NOT NULL,
-      level_id TEXT,
-      error TEXT,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      FOREIGN KEY(level_id) REFERENCES levels(id)
-    );
-  `);
-
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_levels_published ON levels(published);`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);`);
 }
 
 function rowToLevel(row: LevelRow): LevelT {
@@ -266,10 +235,9 @@ export function getJob(id: string): JobRecord | null {
   };
 }
 
-export function isDbHealthy(): boolean {
+export function pingDb(database: Database.Database = getDb()): boolean {
   try {
-    const db = getDb();
-    db.prepare('SELECT 1').get();
+    database.prepare('SELECT 1').get();
     return true;
   } catch (error) {
     return false;
