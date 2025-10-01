@@ -1,0 +1,19 @@
+{
+  "name": "web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 5173",
+    "lint": "eslint \"src/**/*.{ts,tsx}\"",
+    "format": "prettier --check \"src/**/*.{ts,tsx,css,html}\""
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.10.6",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.8"
+  }
+}

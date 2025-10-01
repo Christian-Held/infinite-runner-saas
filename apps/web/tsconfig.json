@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "moduleResolution": "Bundler",
+    "allowJs": false,
+    "types": ["vite/client"]
+  },
+  "include": ["src", "vite.config.ts", "tsconfig.node.json"],
+  "exclude": ["dist", "node_modules"]
+}
