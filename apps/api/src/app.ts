@@ -1,11 +1,12 @@
-import 'dotenv/config';
-
+import dotenv from 'dotenv';
 import IORedis from 'ioredis';
 import process from 'node:process';
 
 import { openDb } from './db';
 import { migrate } from './db/migrate';
 import { buildServer } from './server';
+
+dotenv.config();
 
 async function bootstrap() {
   const port = Number.parseInt(process.env.PORT ?? '3000', 10);
@@ -89,6 +90,8 @@ async function bootstrap() {
 
     throw error;
   }
+
+  console.log(`API listening on :${port}`);
   server.log.info(`API listening on :${port}`);
 }
 
@@ -96,14 +99,9 @@ async function main() {
   try {
     await bootstrap();
   } catch (error) {
-    console.error('Failed to start API', error);
+    console.error('FATAL BOOT ERROR', error);
     process.exit(1);
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch((error) => {
-    console.error('Unhandled error while starting API', error);
-    process.exit(1);
-  });
-}
+void main();
