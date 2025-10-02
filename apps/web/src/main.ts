@@ -2,6 +2,8 @@ import Phaser from 'phaser';
 
 import { BootScene } from './scenes/BootScene';
 import { GameScene } from './scenes/GameScene';
+import { StartScene } from './scenes/StartScene';
+import { TransitionScene } from './scenes/TransitionScene';
 import { RUNNER_CONSTANTS } from './types/game';
 
 const config: Phaser.Types.Core.GameConfig = {
@@ -27,7 +29,7 @@ const config: Phaser.Types.Core.GameConfig = {
     forceSetTimeOut: true,
     smoothStep: true,
   },
-  scene: [BootScene, GameScene],
+  scene: [BootScene, StartScene, TransitionScene, GameScene],
 };
 
 new Phaser.Game(config);
