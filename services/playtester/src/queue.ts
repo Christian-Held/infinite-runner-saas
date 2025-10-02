@@ -96,18 +96,17 @@ export async function startWorkers(): Promise<WorkerRuntime> {
         const result = await testLevel(level);
         if (!result.ok || !result.path) {
           const reason = result.reason ?? 'no_path';
+          console.log(
+            `[testWorker] search done nodes=${result.nodes ?? 0} time=${result.durationMs ?? 0}ms result=fail(${reason})`,
+          );
           throw new Error(reason);
         }
 
         await submitLevelPath({ levelId: job.data.levelId, path: result.path });
         await updateJobStatus({ id: jobId, status: 'succeeded', levelId: job.data.levelId });
-        console.log('[testWorker] search done', {
-          jobId,
-          nodes: result.nodes ?? 0,
-          visited: result.visited ?? 0,
-          durationMs: result.durationMs ?? 0,
-          result: 'ok',
-        });
+        console.log(
+          `[testWorker] search done nodes=${result.nodes ?? 0} time=${result.durationMs ?? 0}ms result=ok`,
+        );
       } catch (error) {
         const message = toErrorMessage(error);
         await updateJobStatus({ id: jobId, status: 'failed', error: message, levelId: job.data.levelId });

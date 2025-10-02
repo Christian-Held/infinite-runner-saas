@@ -34,6 +34,7 @@ Alle Level-Daten validieren gegen `@ir/game-spec`, persistieren in SQLite (`./ap
   - `REDIS_URL` (Standard: `redis://redis:6379`)
   - `API_BASE_URL` (Standard: `http://localhost:3000`)
   - `INTERNAL_TOKEN` (muss mit der API übereinstimmen, Standard `dev-internal`)
+- Lokale Konfiguration: `.env` im Ordner `services/playtester/` (UTF-8, ohne Anführungszeichen). Änderungen erfordern einen Neustart des Playtester-Services.
 - Queues: `gen` (Concurrency 2) & `test` (Concurrency 4) via BullMQ.
 - Der Worker schreibt Levels und Job-Status über interne API-Endpunkte (`/internal/*`) zurück.
 

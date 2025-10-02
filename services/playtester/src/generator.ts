@@ -8,25 +8,36 @@ import OpenAI from 'openai';
 import seedrandom from 'seedrandom';
 import { z } from 'zod';
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL ?? 'gpt-4.1-mini';
 const OPENAI_REQ_TIMEOUT_MS = Number(process.env.OPENAI_REQ_TIMEOUT_MS ?? '20000');
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
 const GEN_MAX_ATTEMPTS = Number(process.env.GEN_MAX_ATTEMPTS ?? '3');
 const GEN_SIMHASH_TTL_SEC = Number(process.env.GEN_SIMHASH_TTL_SEC ?? '604800');
 
-if (!OPENAI_API_KEY) {
-  throw new Error('OPENAI_API_KEY is not set');
+let openaiClient: OpenAI | null = null;
+let redisClient: IORedis | null = null;
+
+export function clients(): { openai: OpenAI; redis: IORedis } {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new Error('OPENAI_API_KEY is not set');
+  }
+
+  if (!openaiClient) {
+    openaiClient = new OpenAI({
+      apiKey,
+      timeout: OPENAI_REQ_TIMEOUT_MS,
+    });
+  }
+
+  if (!redisClient) {
+    redisClient = new IORedis(REDIS_URL, {
+      enableOfflineQueue: false,
+    });
+  }
+
+  return { openai: openaiClient, redis: redisClient };
 }
-
-const openai = new OpenAI({
-  apiKey: OPENAI_API_KEY,
-  timeout: OPENAI_REQ_TIMEOUT_MS,
-});
-
-const redis = new IORedis(REDIS_URL, {
-  enableOfflineQueue: false,
-});
 
 export interface GenerationConstraints {
   gravityY: number;
@@ -190,16 +201,19 @@ function createSignature(level: LevelShape): string {
 
 async function isDuplicate(signature: string): Promise<boolean> {
   const key = `sig:level:${signature}`;
+  const { redis } = clients();
   const existing = await redis.get(key);
   return Boolean(existing);
 }
 
 async function rememberSignature(signature: string, levelId: string): Promise<void> {
   const key = `sig:level:${signature}`;
+  const { redis } = clients();
   await redis.set(key, levelId, 'EX', GEN_SIMHASH_TTL_SEC);
 }
 
 async function callModel(prompt: PromptFragments) {
+  const { openai } = clients();
   const response = await openai.responses.create({
     model: OPENAI_MODEL,
     input: [
@@ -305,9 +319,15 @@ export async function generateLevel(
 }
 
 export async function closeGenerator(): Promise<void> {
+  if (!redisClient) {
+    return;
+  }
+
   try {
-    await redis.quit();
+    await redisClient.quit();
   } catch (error) {
-    redis.disconnect();
+    redisClient.disconnect();
+  } finally {
+    redisClient = null;
   }
 }
