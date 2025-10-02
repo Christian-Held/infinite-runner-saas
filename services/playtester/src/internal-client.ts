@@ -3,8 +3,18 @@ import { z } from 'zod';
 
 import { InputCmd } from './sim/arcade';
 
-const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN ?? 'dev-internal';
+const INTERNAL_TOKEN: string = (() => {
+  const token = process.env.INTERNAL_TOKEN;
+  if (!token) {
+    throw new Error('INTERNAL_TOKEN is not set');
+  }
+  return token;
+})();
 const API_BASE_URL = process.env.API_BASE_URL ?? 'http://localhost:3000';
+const INTERNAL_HEADERS: Record<string, string> = Object.freeze({
+  'content-type': 'application/json',
+  'x-internal-token': INTERNAL_TOKEN,
+});
 
 const JobStatusSchema = z.enum(['queued', 'running', 'failed', 'succeeded']);
 const JobTypeSchema = z.enum(['gen', 'test']);
@@ -19,10 +29,7 @@ export interface IngestLevelPayload {
 export async function ingestLevel(payload: IngestLevelPayload): Promise<{ id: string }> {
   const response = await fetch(`${API_BASE_URL}/internal/levels`, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-internal-token': INTERNAL_TOKEN,
-    },
+    headers: INTERNAL_HEADERS,
     body: JSON.stringify({
       level: Level.parse(payload.level),
       meta: {
@@ -48,10 +55,7 @@ export async function createJobRecord(params: {
 }): Promise<void> {
   const response = await fetch(`${API_BASE_URL}/internal/jobs`, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-internal-token': INTERNAL_TOKEN,
-    },
+    headers: INTERNAL_HEADERS,
     body: JSON.stringify({
       id: params.id,
       type: JobTypeSchema.parse(params.type),
@@ -76,10 +80,7 @@ export async function updateJobStatus(params: {
 }): Promise<void> {
   const response = await fetch(`${API_BASE_URL}/internal/jobs/${params.id}/status`, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-internal-token': INTERNAL_TOKEN,
-    },
+    headers: INTERNAL_HEADERS,
     body: JSON.stringify({
       status: JobStatusSchema.parse(params.status),
       error: params.error ?? null,
@@ -117,10 +118,7 @@ export async function submitLevelPath(params: {
 }): Promise<void> {
   const response = await fetch(`${API_BASE_URL}/internal/levels/path`, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-internal-token': INTERNAL_TOKEN,
-    },
+    headers: INTERNAL_HEADERS,
     body: JSON.stringify({
       level_id: params.levelId,
       path: params.path,
@@ -141,10 +139,7 @@ export async function submitLevelPatch(params: {
 }): Promise<void> {
   const response = await fetch(`${API_BASE_URL}/internal/levels/patch`, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-internal-token': INTERNAL_TOKEN,
-    },
+    headers: INTERNAL_HEADERS,
     body: JSON.stringify({
       level_id: params.levelId,
       patch: params.patch,
@@ -165,10 +160,7 @@ export async function submitLevelMetrics(params: {
 }): Promise<void> {
   const response = await fetch(`${API_BASE_URL}/internal/levels/metrics`, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-internal-token': INTERNAL_TOKEN,
-    },
+    headers: INTERNAL_HEADERS,
     body: JSON.stringify({
       level_id: params.levelId,
       score: params.score,

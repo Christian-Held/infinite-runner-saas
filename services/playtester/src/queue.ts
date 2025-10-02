@@ -19,6 +19,7 @@ import {
 import { testLevel } from './tester';
 import { tune } from './tuner';
 import { scoreLevel } from './scoring';
+import { recordQueueJob } from './metrics';
 
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
 const MAX_TUNE_ROUNDS = Number.parseInt(process.env.TUNE_MAX_ROUNDS ?? '3', 10);
@@ -66,6 +67,7 @@ export async function startWorkers(): Promise<WorkerRuntime> {
     'gen',
     async (job) => {
       const jobId = job.id ?? randomUUID();
+      const startedAt = process.hrtime.bigint();
       try {
         await updateJobStatus({ id: jobId, status: 'running' });
 
@@ -123,6 +125,7 @@ export async function startWorkers(): Promise<WorkerRuntime> {
           });
           throw error;
         }
+        recordQueueJob('gen', 'succeeded', startedAt);
       } catch (error) {
         const message = toErrorMessage(error);
         await updateJobStatus({ id: jobId, status: 'failed', error: message });
@@ -134,6 +137,7 @@ export async function startWorkers(): Promise<WorkerRuntime> {
             jobId,
           });
         }
+        recordQueueJob('gen', 'failed', startedAt);
         throw error;
       }
     },
@@ -147,6 +151,7 @@ export async function startWorkers(): Promise<WorkerRuntime> {
     'test',
     async (job) => {
       const jobId = job.id ?? randomUUID();
+      const startedAt = process.hrtime.bigint();
       let failedAttempts = 0;
       let lastReason: string | undefined;
       try {
@@ -185,6 +190,7 @@ export async function startWorkers(): Promise<WorkerRuntime> {
             console.log(
               `[testWorker] attempt=${round + 1} nodes=${result.nodes ?? 0} time=${result.durationMs ?? 0}ms result=ok`,
             );
+            recordQueueJob('test', 'succeeded', startedAt);
             return;
           }
 
@@ -246,6 +252,7 @@ export async function startWorkers(): Promise<WorkerRuntime> {
             jobId,
           });
         }
+        recordQueueJob('test', 'failed', startedAt);
         throw error;
       }
     },

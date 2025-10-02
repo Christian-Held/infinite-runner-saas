@@ -3,8 +3,9 @@ version: '3.9'
 services:
   web:
     build:
-      context: ./apps/web
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: apps/web/Dockerfile
+      target: deps
     command: pnpm dev --host 0.0.0.0 --port 5173
     ports:
       - '5173:5173'
@@ -17,8 +18,9 @@ services:
 
   api:
     build:
-      context: ./apps/api
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: deps
     command: pnpm dev
     ports:
       - '3000:3000'
@@ -33,8 +35,9 @@ services:
 
   playtester:
     build:
-      context: ./services/playtester
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/playtester/Dockerfile
+      target: deps
     command: pnpm dev
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}

@@ -1,12 +1,20 @@
-FROM node:20-alpine
-WORKDIR /app
-ENV NODE_ENV=development
+FROM node:20-alpine AS base
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
 RUN corepack enable
-COPY package.json ./
-COPY tsconfig*.json ./
-COPY vite.config.ts ./
-COPY index.html ./
-COPY src ./src
-RUN pnpm install
-EXPOSE 5173
-CMD ["pnpm", "dev", "--host", "0.0.0.0", "--port", "5173"]
+WORKDIR /app
+
+FROM base AS deps
+COPY . .
+RUN pnpm install --frozen-lockfile=false
+
+FROM deps AS builder
+RUN pnpm --filter web build
+
+FROM base AS runner
+WORKDIR /app/apps/web
+ENV NODE_ENV=production
+RUN pnpm add --global serve
+COPY --from=builder /app/apps/web/dist ./dist
+EXPOSE 8080
+CMD ["serve", "-s", "dist", "-l", "8080"]

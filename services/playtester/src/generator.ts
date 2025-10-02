@@ -3,43 +3,15 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { Ability, Level, getLevelPlan } from '@ir/game-spec';
 import stringify from 'fast-json-stable-stringify';
-import IORedis from 'ioredis';
-import OpenAI from 'openai';
 import seedrandom from 'seedrandom';
 import { z } from 'zod';
 
+import { getOpenAIClient, getRedisClient, closeClients, getModel } from './clients';
+import { trackAndCheck } from './costguard';
 import { scoreLevel, withinBand } from './scoring';
 
-const OPENAI_MODEL = process.env.OPENAI_MODEL ?? 'gpt-4.1-mini';
-const OPENAI_REQ_TIMEOUT_MS = Number(process.env.OPENAI_REQ_TIMEOUT_MS ?? '20000');
-const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
 const GEN_MAX_ATTEMPTS = Number(process.env.GEN_MAX_ATTEMPTS ?? '3');
 const GEN_SIMHASH_TTL_SEC = Number(process.env.GEN_SIMHASH_TTL_SEC ?? '604800');
-
-let openaiClient: OpenAI | null = null;
-let redisClient: IORedis | null = null;
-
-export function clients(): { openai: OpenAI; redis: IORedis } {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new Error('OPENAI_API_KEY is not set');
-  }
-
-  if (!openaiClient) {
-    openaiClient = new OpenAI({
-      apiKey,
-      timeout: OPENAI_REQ_TIMEOUT_MS,
-    });
-  }
-
-  if (!redisClient) {
-    redisClient = new IORedis(REDIS_URL, {
-      enableOfflineQueue: false,
-    });
-  }
-
-  return { openai: openaiClient, redis: redisClient };
-}
 
 export interface GenerationConstraints {
   gravityY: number;
@@ -239,21 +211,21 @@ function createSignature(level: LevelShape): string {
 
 async function isDuplicate(signature: string): Promise<boolean> {
   const key = `sig:level:${signature}`;
-  const { redis } = clients();
+  const redis = getRedisClient();
   const existing = await redis.get(key);
   return Boolean(existing);
 }
 
 async function rememberSignature(signature: string, levelId: string): Promise<void> {
   const key = `sig:level:${signature}`;
-  const { redis } = clients();
+  const redis = getRedisClient();
   await redis.set(key, levelId, 'EX', GEN_SIMHASH_TTL_SEC);
 }
 
 async function callModel(prompt: PromptFragments) {
-  const { openai } = clients();
+  const openai = getOpenAIClient();
   const response = await openai.responses.create({
-    model: OPENAI_MODEL,
+    model: getModel(),
     input: [
       {
         role: 'system',
@@ -271,11 +243,19 @@ async function callModel(prompt: PromptFragments) {
   const text = response.output_text ?? '';
   const usage = response.usage ?? undefined;
   if (usage) {
-    console.info('[generator] usage', {
-      inputTokens: usage.input_tokens,
-      outputTokens: usage.output_tokens,
-      totalTokens: usage.total_tokens,
+    const guardResult = await trackAndCheck({
+      inputTokens: usage.input_tokens ?? 0,
+      outputTokens: usage.output_tokens ?? 0,
     });
+    console.info('[generator] usage', {
+      inputTokens: usage.input_tokens ?? 0,
+      outputTokens: usage.output_tokens ?? 0,
+      totalTokens: usage.total_tokens ?? 0,
+      remainingUsd: Number(guardResult.remainingUsd.toFixed(4)),
+    });
+    if (!guardResult.ok) {
+      throw new Error('budget_exceeded');
+    }
   }
   return text;
 }
@@ -387,15 +367,5 @@ export async function generateLevel(
 }
 
 export async function closeGenerator(): Promise<void> {
-  if (!redisClient) {
-    return;
-  }
-
-  try {
-    await redisClient.quit();
-  } catch {
-    redisClient.disconnect();
-  } finally {
-    redisClient = null;
-  }
+  await closeClients();
 }
