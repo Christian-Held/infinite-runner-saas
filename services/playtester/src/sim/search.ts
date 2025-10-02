@@ -187,8 +187,8 @@ function advance(level: LevelT, context: ReturnType<typeof createStepContext>, s
   for (let i = 0; i < ACTION_FRAMES; i += 1) {
     const { state: next, collidedHazard } = step(level, current, input, context);
     current = next;
-    hazard ||= collidedHazard;
-    if (hazard) {
+    if (collidedHazard) {
+      hazard = true;
       break;
     }
   }

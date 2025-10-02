@@ -54,7 +54,7 @@ interface Rect {
 
 interface StepResult {
   state: PlayerState;
-  collidedHazard: boolean;
+  collidedHazard: Rect | null;
 }
 
 export interface StepContext {
@@ -69,6 +69,10 @@ export interface SimResult {
   frames: number;
   reason?: string;
   path: InputCmd[];
+  fail?: {
+    at: { x: number; y: number };
+    hazard?: Rect;
+  };
 }
 
 const WALKABLE_TYPES: LevelT['tiles'][number]['type'][] = ['ground', 'platform'];
@@ -425,7 +429,7 @@ export function step(level: LevelT, state: PlayerState, input: InputState, conte
   next.furthestX = Math.max(previous.furthestX, next.x);
 
   const playerRect: Rect = { x: next.x, y: next.y, w: PLAYER_WIDTH, h: PLAYER_HEIGHT };
-  const collidedHazard = ctx.hazards.some((hazard) => rectsOverlap(playerRect, hazard));
+  const collidedHazard = ctx.hazards.find((hazard) => rectsOverlap(playerRect, hazard)) ?? null;
 
   return { state: next, collidedHazard };
 }
@@ -468,7 +472,7 @@ function compressExecuted(commands: InputCmd[]): InputCmd[] {
 export function simulate(level: LevelT, inputs: InputCmd[]): SimResult {
   const baseState = initialPlayerState(level);
   if (!baseState) {
-    return { ok: false, reason: 'no_spawn', frames: 0, path: [] };
+    return { ok: false, reason: 'no_spawn', frames: 0, path: [], fail: { at: { x: 0, y: level.exit.y } } };
   }
 
   const commands = mergeCommands(inputs);
@@ -502,11 +506,23 @@ export function simulate(level: LevelT, inputs: InputCmd[]): SimResult {
     }
 
     if (collidedHazard) {
-      return { ok: false, frames: state.frame, reason: 'hazard', path: compressExecuted(applied) };
+      return {
+        ok: false,
+        frames: state.frame,
+        reason: 'hazard',
+        path: compressExecuted(applied),
+        fail: { at: { x: state.x, y: state.y }, hazard: collidedHazard },
+      };
     }
   }
 
-  return { ok: false, frames: state.frame, reason: 'timeout', path: compressExecuted(applied) };
+  return {
+    ok: false,
+    frames: state.frame,
+    reason: 'timeout',
+    path: compressExecuted(applied),
+    fail: { at: { x: state.x, y: state.y } },
+  };
 }
 
 export function maxJumpGapPX(highJump = false): number {

@@ -4,6 +4,7 @@ import Fastify, { type FastifyRequest } from 'fastify';
 import type IORedis from 'ioredis';
 import pino from 'pino';
 import { z } from 'zod';
+import { randomUUID } from 'node:crypto';
 
 import { Ability, Level } from '@ir/game-spec';
 
@@ -13,7 +14,10 @@ import {
   getLevelPath,
   insertJob,
   insertLevel,
+  insertLevelRevision,
+  listLevelRevisions,
   pingDb,
+  updateLevel,
   upsertLevelPath,
   updateJobStatus,
 } from './db';
@@ -59,6 +63,8 @@ const UpdateJobBody = z.object({
   status: z.enum(['queued', 'running', 'failed', 'succeeded']),
   error: z.string().nullable().optional(),
   levelId: z.string().optional(),
+  attempts: z.number().int().min(0).optional(),
+  lastReason: z.string().nullable().optional(),
 });
 
 const InputCmdSchema = z.object({
@@ -73,6 +79,13 @@ const InputCmdSchema = z.object({
 const InternalPathBody = z.object({
   level_id: z.string(),
   path: z.array(InputCmdSchema),
+});
+
+const LevelPatchBody = z.object({
+  level_id: z.string(),
+  patch: z.any(),
+  reason: z.string(),
+  level: Level,
 });
 
 export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
@@ -143,6 +156,17 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
     reply.send({ level_id: id, path });
   });
 
+  server.get('/levels/:id/revisions', async (request, reply) => {
+    const id = z.string().parse((request.params as any).id);
+    const level = getLevel(id);
+    if (!level) {
+      reply.status(404).send({ error: 'not_found' });
+      return;
+    }
+    const revisions = listLevelRevisions(id);
+    reply.send({ level_id: id, revisions });
+  });
+
   server.get('/jobs/:id', async (request, reply) => {
     const id = z.string().parse((request.params as any).id);
     const job = getJob(id);
@@ -189,7 +213,12 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
 
     const id = z.string().parse((request.params as any).id);
     const body = UpdateJobBody.parse(request.body ?? {});
-    updateJobStatus(id, body.status, { error: body.error ?? undefined, levelId: body.levelId });
+    updateJobStatus(id, body.status, {
+      error: body.error ?? undefined,
+      levelId: body.levelId,
+      attempts: typeof body.attempts === 'number' ? body.attempts : undefined,
+      lastReason: body.lastReason ?? undefined,
+    });
     reply.status(204).send();
   });
 
@@ -210,6 +239,33 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
 
     upsertLevelPath(body.level_id, body.path);
     reply.status(204).send();
+  });
+
+  server.post('/internal/levels/patch', async (request, reply) => {
+    try {
+      requireInternalToken(request);
+    } catch (error) {
+      reply.status(401).send({ error: 'unauthorized' });
+      return;
+    }
+
+    const body = LevelPatchBody.parse(request.body ?? {});
+    const existing = getLevel(body.level_id);
+    if (!existing) {
+      reply.status(404).send({ error: 'level_not_found' });
+      return;
+    }
+
+    const parsedLevel = Level.parse(body.level);
+    if (parsedLevel.id !== body.level_id) {
+      reply.status(400).send({ error: 'id_mismatch' });
+      return;
+    }
+
+    const revisionId = randomUUID();
+    insertLevelRevision({ id: revisionId, levelId: body.level_id, patch: body.patch, reason: body.reason });
+    updateLevel(parsedLevel);
+    reply.status(201).send({ id: revisionId });
   });
 
   server.setNotFoundHandler((_request, reply) => {

@@ -5,11 +5,20 @@ import { Queue, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { z } from 'zod';
 
-import { DEFAULT_CONSTRAINTS, closeGenerator, generateLevel } from './generator';
-import { fetchLevel, ingestLevel, createJobRecord, updateJobStatus, submitLevelPath } from './internal-client';
+import { closeGenerator, generateLevel } from './generator';
+import {
+  fetchLevel,
+  ingestLevel,
+  createJobRecord,
+  updateJobStatus,
+  submitLevelPath,
+  submitLevelPatch,
+} from './internal-client';
 import { testLevel } from './tester';
+import { tune } from './tuner';
 
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
+const MAX_TUNE_ROUNDS = Number.parseInt(process.env.TUNE_MAX_ROUNDS ?? '3', 10);
 
 const AbilityInputSchema = Ability;
 
@@ -89,27 +98,79 @@ export async function startWorkers(): Promise<WorkerRuntime> {
     'test',
     async (job) => {
       const jobId = job.id ?? randomUUID();
+      let failedAttempts = 0;
+      let lastReason: string | undefined;
       try {
-        await updateJobStatus({ id: jobId, status: 'running' });
+        await updateJobStatus({ id: jobId, status: 'running', levelId: job.data.levelId, attempts: 0 });
 
-        const level = await fetchLevel(job.data.levelId);
-        const result = await testLevel(level);
-        if (!result.ok || !result.path) {
-          const reason = result.reason ?? 'no_path';
+        let level = await fetchLevel(job.data.levelId);
+        const maxRounds = Number.isFinite(MAX_TUNE_ROUNDS) && MAX_TUNE_ROUNDS > 0 ? MAX_TUNE_ROUNDS : 3;
+
+        for (let round = 0; round < maxRounds; round += 1) {
+          const result = await testLevel(level);
+          if (result.ok && result.path) {
+            await submitLevelPath({ levelId: job.data.levelId, path: result.path });
+            await updateJobStatus({
+              id: jobId,
+              status: 'succeeded',
+              levelId: job.data.levelId,
+              attempts: failedAttempts,
+            });
+            console.log(
+              `[testWorker] attempt=${round + 1} nodes=${result.nodes ?? 0} time=${result.durationMs ?? 0}ms result=ok`,
+            );
+            return;
+          }
+
+          const fail = result.fail ?? {
+            ok: false as const,
+            reason: result.reason ?? 'no_path',
+          };
+
+          failedAttempts += 1;
+          lastReason = fail.reason;
+
+          await updateJobStatus({
+            id: jobId,
+            status: 'running',
+            levelId: job.data.levelId,
+            attempts: failedAttempts,
+            lastReason,
+          });
+
+          const tuned = tune(level, fail);
+
           console.log(
-            `[testWorker] search done nodes=${result.nodes ?? 0} time=${result.durationMs ?? 0}ms result=fail(${reason})`,
+            `[testWorker] attempt=${round + 1} nodes=${result.nodes ?? 0} time=${result.durationMs ?? 0}ms fail=${fail.reason} patch=${
+              tuned?.patch.op ?? 'none'
+            }`,
           );
-          throw new Error(reason);
+
+          if (!tuned) {
+            throw new Error(fail.reason);
+          }
+
+          await submitLevelPatch({
+            levelId: job.data.levelId,
+            patch: tuned.patch,
+            reason: fail.reason,
+            level: tuned.patched,
+          });
+
+          level = tuned.patched;
         }
 
-        await submitLevelPath({ levelId: job.data.levelId, path: result.path });
-        await updateJobStatus({ id: jobId, status: 'succeeded', levelId: job.data.levelId });
-        console.log(
-          `[testWorker] search done nodes=${result.nodes ?? 0} time=${result.durationMs ?? 0}ms result=ok`,
-        );
+        throw new Error(lastReason ?? 'no_path');
       } catch (error) {
         const message = toErrorMessage(error);
-        await updateJobStatus({ id: jobId, status: 'failed', error: message, levelId: job.data.levelId });
+        await updateJobStatus({
+          id: jobId,
+          status: 'failed',
+          error: message,
+          levelId: job.data.levelId,
+          attempts: failedAttempts,
+          lastReason,
+        });
         throw error;
       }
     },

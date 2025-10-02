@@ -13,6 +13,8 @@ export interface JobRecord {
   status: JobStatus;
   levelId: string | null;
   error: string | null;
+  attempts: number;
+  lastReason: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -46,6 +48,8 @@ interface JobRow {
   status: string;
   level_id: string | null;
   error: string | null;
+  attempts: number;
+  last_reason: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -55,6 +59,22 @@ interface LevelPathRow {
   path_json: string;
   created_at: number;
   updated_at: number;
+}
+
+interface LevelRevisionRow {
+  id: string;
+  level_id: string;
+  patch_json: string;
+  reason: string;
+  created_at: number;
+}
+
+export interface LevelRevisionRecord {
+  id: string;
+  levelId: string;
+  patch: unknown;
+  reason: string;
+  createdAt: number;
 }
 
 const DEFAULT_DB_PATH = './data/app.db';
@@ -148,6 +168,65 @@ export function insertLevel(level: LevelT, meta: { difficulty: number; seed: str
   );
 }
 
+export function updateLevel(level: LevelT) {
+  const db = getDb();
+  const stmt = db.prepare(`
+    UPDATE levels
+    SET rules_json = ?,
+        tiles_json = ?,
+        moving_json = ?,
+        items_json = ?,
+        enemies_json = ?,
+        checkpoints_json = ?,
+        exit_json = ?,
+        updated_at = ?
+    WHERE id = ?
+  `);
+  stmt.run(
+    JSON.stringify(level.rules),
+    JSON.stringify(level.tiles),
+    JSON.stringify(level.moving ?? []),
+    JSON.stringify(level.items ?? []),
+    JSON.stringify(level.enemies ?? []),
+    JSON.stringify(level.checkpoints ?? []),
+    JSON.stringify(level.exit),
+    Date.now(),
+    level.id,
+  );
+}
+
+export function insertLevelRevision(params: { id: string; levelId: string; patch: unknown; reason: string; createdAt?: number }) {
+  const db = getDb();
+  const createdAt = params.createdAt ?? Date.now();
+  const stmt = db.prepare(`
+    INSERT INTO level_revisions (id, level_id, patch_json, reason, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  stmt.run(params.id, params.levelId, JSON.stringify(params.patch ?? {}), params.reason, createdAt);
+}
+
+export function listLevelRevisions(levelId: string): LevelRevisionRecord[] {
+  const db = getDb();
+  const rows = db
+    .prepare('SELECT * FROM level_revisions WHERE level_id = ? ORDER BY created_at DESC')
+    .all(levelId) as LevelRevisionRow[];
+  return rows.map((row) => {
+    let patch: unknown = null;
+    try {
+      patch = JSON.parse(row.patch_json);
+    } catch (error) {
+      patch = null;
+    }
+    return {
+      id: row.id,
+      levelId: row.level_id,
+      patch,
+      reason: row.reason,
+      createdAt: row.created_at,
+    };
+  });
+}
+
 export function getLevel(id: string): LevelT | null {
   const db = getDb();
   const row = db.prepare('SELECT * FROM levels WHERE id = ?').get(id) as LevelRow | undefined;
@@ -205,23 +284,37 @@ export function insertJob(job: { id: string; type: JobType; status: JobStatus; l
   const db = getDb();
   const now = Date.now();
   const stmt = db.prepare(`
-    INSERT INTO jobs (id, type, status, level_id, error, created_at, updated_at)
-    VALUES (?, ?, ?, ?, NULL, ?, ?)
+    INSERT INTO jobs (id, type, status, level_id, error, attempts, last_reason, created_at, updated_at)
+    VALUES (?, ?, ?, ?, NULL, 0, NULL, ?, ?)
   `);
   stmt.run(job.id, job.type, job.status, job.level_id ?? null, now, now);
 }
 
-export function updateJobStatus(id: string, status: JobStatus, options: { error?: string; levelId?: string } = {}) {
+export function updateJobStatus(
+  id: string,
+  status: JobStatus,
+  options: { error?: string; levelId?: string; attempts?: number; lastReason?: string } = {},
+) {
   const db = getDb();
   const stmt = db.prepare(`
     UPDATE jobs
     SET status = ?,
         error = ?,
         level_id = COALESCE(?, level_id),
+        attempts = COALESCE(?, attempts),
+        last_reason = COALESCE(?, last_reason),
         updated_at = ?
     WHERE id = ?
   `);
-  stmt.run(status, options.error ?? null, options.levelId ?? null, Date.now(), id);
+  stmt.run(
+    status,
+    options.error ?? null,
+    options.levelId ?? null,
+    options.attempts ?? null,
+    options.lastReason ?? null,
+    Date.now(),
+    id,
+  );
 }
 
 export function getJob(id: string): JobRecord | null {
@@ -237,6 +330,8 @@ export function getJob(id: string): JobRecord | null {
     status: row.status as JobStatus,
     levelId: row.level_id ?? null,
     error: row.error ?? null,
+    attempts: row.attempts ?? 0,
+    lastReason: row.last_reason ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
