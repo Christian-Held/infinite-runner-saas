@@ -68,4 +68,7 @@ export const Level = z.object({
   exit: Exit,
 });
 
+export type AbilityT = z.infer<typeof Ability>;
 export type LevelT = z.infer<typeof Level>;
+
+export * from './progression';

@@ -7,10 +7,14 @@ async function bootstrap() {
   console.log('[playtester] Workers for gen/test queues started');
 
   if (!process.env.OPENAI_API_KEY) {
-    console.error('[playtester] OPENAI_API_KEY is not set. Please configure services/playtester/.env and restart.');
+    console.error(
+      '[playtester] OPENAI_API_KEY is not set. Please configure services/playtester/.env and restart.',
+    );
     await runtime
       .close()
-      .catch((error) => console.error('[playtester] Failed to close runtime after missing API key', error));
+      .catch((error) =>
+        console.error('[playtester] Failed to close runtime after missing API key', error),
+      );
     process.exit(1);
   }
 

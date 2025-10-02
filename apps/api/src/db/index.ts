@@ -6,6 +6,43 @@ import { Level, LevelT } from '@ir/game-spec';
 
 export type JobType = 'gen' | 'test';
 export type JobStatus = 'queued' | 'running' | 'failed' | 'succeeded';
+export type SeasonJobStatus = 'queued' | 'running' | 'failed' | 'succeeded';
+
+export interface LevelMetricRecord {
+  levelId: string;
+  score: number;
+  createdAt: number;
+}
+
+export interface SeasonJobRecord {
+  seasonId: string;
+  levelNumber: number;
+  jobId: string | null;
+  status: SeasonJobStatus;
+  levelId: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface SeasonLevelInfo {
+  seasonId: string;
+  levelNumber: number;
+  status: SeasonJobStatus;
+  jobId: string | null;
+  levelId: string | null;
+  published: boolean;
+  score: number | null;
+  updatedAt: number;
+}
+
+export interface SeasonStatusSummary {
+  seasonId: string;
+  total: number;
+  queued: number;
+  running: number;
+  succeeded: number;
+  failed: number;
+}
 
 export interface JobRecord {
   id: string;
@@ -67,6 +104,22 @@ interface LevelRevisionRow {
   patch_json: string;
   reason: string;
   created_at: number;
+}
+
+interface LevelMetricRow {
+  level_id: string;
+  score: number;
+  created_at: number;
+}
+
+interface SeasonJobRow {
+  season_id: string;
+  level_number: number;
+  job_id: string | null;
+  status: string;
+  level_id: string | null;
+  created_at: number;
+  updated_at: number;
 }
 
 export interface LevelRevisionRecord {
@@ -195,7 +248,13 @@ export function updateLevel(level: LevelT) {
   );
 }
 
-export function insertLevelRevision(params: { id: string; levelId: string; patch: unknown; reason: string; createdAt?: number }) {
+export function insertLevelRevision(params: {
+  id: string;
+  levelId: string;
+  patch: unknown;
+  reason: string;
+  createdAt?: number;
+}) {
   const db = getDb();
   const createdAt = params.createdAt ?? Date.now();
   const stmt = db.prepare(`
@@ -214,7 +273,7 @@ export function listLevelRevisions(levelId: string): LevelRevisionRecord[] {
     let patch: unknown = null;
     try {
       patch = JSON.parse(row.patch_json);
-    } catch (error) {
+    } catch {
       patch = null;
     }
     return {
@@ -227,6 +286,33 @@ export function listLevelRevisions(levelId: string): LevelRevisionRecord[] {
   });
 }
 
+export function upsertLevelMetric(
+  levelId: string,
+  score: number,
+  createdAt: number = Date.now(),
+): void {
+  const db = getDb();
+  const stmt = db.prepare(`
+    INSERT INTO level_metrics (level_id, score, created_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(level_id) DO UPDATE SET
+      score = excluded.score,
+      created_at = excluded.created_at
+  `);
+  stmt.run(levelId, score, createdAt);
+}
+
+export function getLevelMetric(levelId: string): LevelMetricRecord | null {
+  const db = getDb();
+  const row = db.prepare('SELECT * FROM level_metrics WHERE level_id = ?').get(levelId) as
+    | LevelMetricRow
+    | undefined;
+  if (!row) {
+    return null;
+  }
+  return { levelId: row.level_id, score: row.score, createdAt: row.created_at };
+}
+
 export function getLevel(id: string): LevelT | null {
   const db = getDb();
   const row = db.prepare('SELECT * FROM levels WHERE id = ?').get(id) as LevelRow | undefined;
@@ -237,10 +323,14 @@ export function getLevel(id: string): LevelT | null {
   return rowToLevel(row);
 }
 
-export function listLevels(params: { published?: boolean; limit?: number; offset?: number }): LevelRecord[] {
+export function listLevels(params: {
+  published?: boolean;
+  limit?: number;
+  offset?: number;
+}): LevelRecord[] {
   const db = getDb();
   const conditions: string[] = [];
-  const values: any[] = [];
+  const values: unknown[] = [];
 
   if (typeof params.published === 'boolean') {
     conditions.push('published = ?');
@@ -280,7 +370,12 @@ export function setPublished(id: string, published: boolean): boolean {
   return result.changes > 0;
 }
 
-export function insertJob(job: { id: string; type: JobType; status: JobStatus; level_id?: string | null }) {
+export function insertJob(job: {
+  id: string;
+  type: JobType;
+  status: JobStatus;
+  level_id?: string | null;
+}) {
   const db = getDb();
   const now = Date.now();
   const stmt = db.prepare(`
@@ -351,23 +446,160 @@ export function upsertLevelPath(levelId: string, path: unknown): void {
 
 export function getLevelPath(levelId: string): unknown | null {
   const db = getDb();
-  const row = db.prepare('SELECT * FROM level_paths WHERE level_id = ?').get(levelId) as LevelPathRow | undefined;
+  const row = db.prepare('SELECT * FROM level_paths WHERE level_id = ?').get(levelId) as
+    | LevelPathRow
+    | undefined;
   if (!row) {
     return null;
   }
 
   try {
     return JSON.parse(row.path_json);
-  } catch (error) {
+  } catch {
     return null;
   }
+}
+
+export function upsertSeasonJob(params: {
+  seasonId: string;
+  levelNumber: number;
+  jobId: string;
+  status: SeasonJobStatus;
+  levelId?: string | null;
+  createdAt?: number;
+}): void {
+  const db = getDb();
+  const now = params.createdAt ?? Date.now();
+  const stmt = db.prepare(`
+    INSERT INTO season_jobs (season_id, level_number, job_id, status, level_id, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(season_id, level_number) DO UPDATE SET
+      job_id = excluded.job_id,
+      status = excluded.status,
+      level_id = COALESCE(excluded.level_id, season_jobs.level_id),
+      updated_at = excluded.updated_at
+  `);
+  stmt.run(
+    params.seasonId,
+    params.levelNumber,
+    params.jobId,
+    params.status,
+    params.levelId ?? null,
+    now,
+    now,
+  );
+}
+
+export function updateSeasonJob(params: {
+  seasonId: string;
+  levelNumber: number;
+  status: SeasonJobStatus;
+  jobId?: string;
+  levelId?: string | null;
+}): void {
+  const db = getDb();
+  const stmt = db.prepare(`
+    UPDATE season_jobs
+    SET status = ?,
+        job_id = COALESCE(?, job_id),
+        level_id = COALESCE(?, level_id),
+        updated_at = ?
+    WHERE season_id = ? AND level_number = ?
+  `);
+  stmt.run(
+    params.status,
+    params.jobId ?? null,
+    params.levelId ?? null,
+    Date.now(),
+    params.seasonId,
+    params.levelNumber,
+  );
+}
+
+export function getSeasonStatus(seasonId: string): SeasonStatusSummary {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      'SELECT status, COUNT(*) as count FROM season_jobs WHERE season_id = ? GROUP BY status',
+    )
+    .all(seasonId) as Array<{ status: string; count: number }>;
+
+  const summary: SeasonStatusSummary = {
+    seasonId,
+    total: 0,
+    queued: 0,
+    running: 0,
+    succeeded: 0,
+    failed: 0,
+  };
+
+  for (const row of rows) {
+    const count = row.count ?? 0;
+    summary.total += count;
+    if (row.status === 'queued') {
+      summary.queued = count;
+    } else if (row.status === 'running') {
+      summary.running = count;
+    } else if (row.status === 'succeeded') {
+      summary.succeeded = count;
+    } else if (row.status === 'failed') {
+      summary.failed = count;
+    }
+  }
+
+  if (summary.total === 0) {
+    const countRow = db
+      .prepare('SELECT COUNT(*) as total FROM season_jobs WHERE season_id = ?')
+      .get(seasonId) as { total?: number } | undefined;
+    summary.total = countRow?.total ?? 0;
+  }
+
+  return summary;
+}
+
+export function listSeasonLevels(params: {
+  seasonId: string;
+  published?: boolean;
+}): SeasonLevelInfo[] {
+  const db = getDb();
+  const values: unknown[] = [params.seasonId];
+  let query = `
+    SELECT sj.season_id, sj.level_number, sj.job_id, sj.status, sj.level_id, sj.updated_at,
+           lvl.published as level_published, metrics.score as level_score
+    FROM season_jobs sj
+    LEFT JOIN levels lvl ON lvl.id = sj.level_id
+    LEFT JOIN level_metrics metrics ON metrics.level_id = sj.level_id
+    WHERE sj.season_id = ?
+  `;
+
+  if (typeof params.published === 'boolean') {
+    query += ' AND COALESCE(lvl.published, 0) = ?';
+    values.push(params.published ? 1 : 0);
+  }
+
+  query += ' ORDER BY sj.level_number ASC';
+
+  const rows = db.prepare(query).all(...values) as Array<
+    SeasonJobRow & { level_published: number | null; level_score: number | null }
+  >;
+
+  return rows.map((row) => ({
+    seasonId: row.season_id,
+    levelNumber: row.level_number,
+    jobId: row.job_id,
+    status: row.status as SeasonJobStatus,
+    levelId: row.level_id,
+    published: Boolean(row.level_published ?? 0),
+    score: typeof row.level_score === 'number' ? row.level_score : null,
+    updatedAt: row.updated_at,
+  }));
 }
 
 export function pingDb(database: Database.Database = getDb()): boolean {
   try {
     database.prepare('SELECT 1').get();
     return true;
-  } catch (error) {
+  } catch {
     return false;
   }
 }

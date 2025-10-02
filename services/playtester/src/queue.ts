@@ -13,9 +13,12 @@ import {
   updateJobStatus,
   submitLevelPath,
   submitLevelPatch,
+  submitLevelMetrics,
+  updateSeasonJobStatus,
 } from './internal-client';
 import { testLevel } from './tester';
 import { tune } from './tuner';
+import { scoreLevel } from './scoring';
 
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
 const MAX_TUNE_ROUNDS = Number.parseInt(process.env.TUNE_MAX_ROUNDS ?? '3', 10);
@@ -26,10 +29,14 @@ export interface GenJobData {
   seed?: string;
   difficulty?: number;
   abilities?: z.input<typeof AbilityInputSchema>;
+  seasonId?: string;
+  levelNumber?: number;
 }
 
 export interface TestJobData {
   levelId: string;
+  seasonId?: string;
+  levelNumber?: number;
 }
 
 export interface WorkerRuntime {
@@ -67,24 +74,66 @@ export async function startWorkers(): Promise<WorkerRuntime> {
         const abilityInput = job.data.abilities ?? { run: true, jump: true };
         const abilities = AbilityInputSchema.parse(abilityInput);
 
-        const level = await generateLevel(seed, difficulty, abilities);
+        if (job.data.seasonId && typeof job.data.levelNumber === 'number') {
+          await updateSeasonJobStatus({
+            seasonId: job.data.seasonId,
+            levelNumber: job.data.levelNumber,
+            status: 'running',
+            jobId,
+          });
+        }
+
+        const level = await generateLevel(
+          seed,
+          difficulty,
+          abilities,
+          job.data.levelNumber,
+          job.data.seasonId,
+        );
 
         await ingestLevel({ level, difficulty, seed: level.seed });
 
         await updateJobStatus({ id: jobId, status: 'succeeded', levelId: level.id });
 
+        if (job.data.seasonId && typeof job.data.levelNumber === 'number') {
+          await updateSeasonJobStatus({
+            seasonId: job.data.seasonId,
+            levelNumber: job.data.levelNumber,
+            status: 'running',
+            jobId,
+            levelId: level.id,
+          });
+        }
+
         const testJobId = randomUUID();
         await createJobRecord({ id: testJobId, type: 'test', status: 'queued', levelId: level.id });
         try {
-          await testQueue.add('playtest', { levelId: level.id }, { jobId: testJobId });
+          await testQueue.add(
+            'playtest',
+            { levelId: level.id, seasonId: job.data.seasonId, levelNumber: job.data.levelNumber },
+            { jobId: testJobId },
+          );
         } catch (error) {
           const message = toErrorMessage(error);
-          await updateJobStatus({ id: testJobId, status: 'failed', error: message, levelId: level.id });
+          await updateJobStatus({
+            id: testJobId,
+            status: 'failed',
+            error: message,
+            levelId: level.id,
+          });
           throw error;
         }
       } catch (error) {
         const message = toErrorMessage(error);
         await updateJobStatus({ id: jobId, status: 'failed', error: message });
+        if (job.data.seasonId && typeof job.data.levelNumber === 'number') {
+          await updateSeasonJobStatus({
+            seasonId: job.data.seasonId,
+            levelNumber: job.data.levelNumber,
+            status: 'failed',
+            jobId,
+          });
+        }
         throw error;
       }
     },
@@ -101,21 +150,38 @@ export async function startWorkers(): Promise<WorkerRuntime> {
       let failedAttempts = 0;
       let lastReason: string | undefined;
       try {
-        await updateJobStatus({ id: jobId, status: 'running', levelId: job.data.levelId, attempts: 0 });
+        await updateJobStatus({
+          id: jobId,
+          status: 'running',
+          levelId: job.data.levelId,
+          attempts: 0,
+        });
 
         let level = await fetchLevel(job.data.levelId);
-        const maxRounds = Number.isFinite(MAX_TUNE_ROUNDS) && MAX_TUNE_ROUNDS > 0 ? MAX_TUNE_ROUNDS : 3;
+        const maxRounds =
+          Number.isFinite(MAX_TUNE_ROUNDS) && MAX_TUNE_ROUNDS > 0 ? MAX_TUNE_ROUNDS : 3;
 
         for (let round = 0; round < maxRounds; round += 1) {
           const result = await testLevel(level);
           if (result.ok && result.path) {
             await submitLevelPath({ levelId: job.data.levelId, path: result.path });
+            const finalScore = scoreLevel(level);
+            await submitLevelMetrics({ levelId: job.data.levelId, score: finalScore });
             await updateJobStatus({
               id: jobId,
               status: 'succeeded',
               levelId: job.data.levelId,
               attempts: failedAttempts,
             });
+            if (job.data.seasonId && typeof job.data.levelNumber === 'number') {
+              await updateSeasonJobStatus({
+                seasonId: job.data.seasonId,
+                levelNumber: job.data.levelNumber,
+                status: 'succeeded',
+                levelId: job.data.levelId,
+                jobId,
+              });
+            }
             console.log(
               `[testWorker] attempt=${round + 1} nodes=${result.nodes ?? 0} time=${result.durationMs ?? 0}ms result=ok`,
             );
@@ -171,6 +237,15 @@ export async function startWorkers(): Promise<WorkerRuntime> {
           attempts: failedAttempts,
           lastReason,
         });
+        if (job.data.seasonId && typeof job.data.levelNumber === 'number') {
+          await updateSeasonJobStatus({
+            seasonId: job.data.seasonId,
+            levelNumber: job.data.levelNumber,
+            status: 'failed',
+            levelId: job.data.levelId,
+            jobId,
+          });
+        }
         throw error;
       }
     },
@@ -192,7 +267,7 @@ export async function startWorkers(): Promise<WorkerRuntime> {
     await Promise.allSettled([genQueue.close(), testQueue.close()]);
     try {
       await connection.quit();
-    } catch (error) {
+    } catch {
       connection.disconnect();
     }
     await closeGenerator();

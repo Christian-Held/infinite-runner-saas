@@ -52,6 +52,67 @@ export async function fetchLevel(id: string): Promise<LevelT> {
   }
 }
 
+export interface SeasonLevelEntry {
+  seasonId: string;
+  levelNumber: number;
+  status: string;
+  levelId: string | null;
+  published: boolean;
+  score: number | null;
+}
+
+export async function fetchSeasonLevels(
+  seasonId: string,
+  options: { published?: boolean } = {},
+): Promise<SeasonLevelEntry[]> {
+  const searchParams = new URLSearchParams();
+  if (typeof options.published === 'boolean') {
+    searchParams.set('published', options.published ? 'true' : 'false');
+  }
+
+  const query = searchParams.toString();
+  const url = `${API_BASE_URL}/seasons/${seasonId}/levels${query ? `?${query}` : ''}`;
+
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to load season levels: ${response.status} ${response.statusText}`);
+    }
+
+    const payload = await response.json();
+    if (!Array.isArray(payload?.levels)) {
+      return [];
+    }
+
+    return (payload.levels as unknown[]).map((entry) => {
+      const record = entry as Record<string, unknown>;
+      const rawLevelNumber = Number(record.levelNumber ?? record.level_number ?? 0);
+      const levelNumber = Number.isFinite(rawLevelNumber)
+        ? Math.max(1, Math.round(rawLevelNumber))
+        : 1;
+
+      const levelId =
+        typeof record.levelId === 'string'
+          ? (record.levelId as string)
+          : typeof record.level_id === 'string'
+            ? (record.level_id as string)
+            : null;
+
+      return {
+        seasonId: typeof payload.seasonId === 'string' ? payload.seasonId : seasonId,
+        levelNumber,
+        status: String(record.status ?? 'queued'),
+        levelId,
+        published: Boolean(record.published),
+        score: typeof record.score === 'number' ? (record.score as number) : null,
+      } satisfies SeasonLevelEntry;
+    });
+  } catch (error) {
+    console.warn(`Konnte Season-Level-Liste für ${seasonId} nicht laden.`, error);
+    return [];
+  }
+}
+
 export interface LevelPathEntry {
   t: number;
   left?: boolean;

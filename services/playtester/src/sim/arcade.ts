@@ -226,7 +226,9 @@ function resolveHorizontalCollisions(
         if (candidate < minX) {
           minX = candidate;
         }
-      } else if (rectsOverlap({ x: targetX, y: previous.y, w: PLAYER_WIDTH, h: PLAYER_HEIGHT }, tile)) {
+      } else if (
+        rectsOverlap({ x: targetX, y: previous.y, w: PLAYER_WIDTH, h: PLAYER_HEIGHT }, tile)
+      ) {
         const candidate = tileLeft - PLAYER_WIDTH;
         if (candidate < minX) {
           minX = candidate;
@@ -247,7 +249,9 @@ function resolveHorizontalCollisions(
         if (candidate > maxX) {
           maxX = candidate;
         }
-      } else if (rectsOverlap({ x: targetX, y: previous.y, w: PLAYER_WIDTH, h: PLAYER_HEIGHT }, tile)) {
+      } else if (
+        rectsOverlap({ x: targetX, y: previous.y, w: PLAYER_WIDTH, h: PLAYER_HEIGHT }, tile)
+      ) {
         const candidate = tileRight;
         if (candidate > maxX) {
           maxX = candidate;
@@ -347,7 +351,12 @@ function applyJump(
   next.jumpBufferMs = 0;
 }
 
-function applyShortFly(previous: PlayerState, next: PlayerState, ctx: StepContext, input: InputState): void {
+function applyShortFly(
+  previous: PlayerState,
+  next: PlayerState,
+  ctx: StepContext,
+  input: InputState,
+): void {
   if (!ctx.abilities.shortFly) {
     return;
   }
@@ -358,7 +367,12 @@ function applyShortFly(previous: PlayerState, next: PlayerState, ctx: StepContex
   next.shortFlyAvailable = false;
 }
 
-function applyJetpack(previous: PlayerState, next: PlayerState, ctx: StepContext, input: InputState): void {
+function applyJetpack(
+  previous: PlayerState,
+  next: PlayerState,
+  ctx: StepContext,
+  input: InputState,
+): void {
   if (!ctx.abilities.jetpack || !input.thrust || previous.jetpackFuel <= 0) {
     next.jetpackFuel = previous.jetpackFuel;
     return;
@@ -367,7 +381,12 @@ function applyJetpack(previous: PlayerState, next: PlayerState, ctx: StepContext
   next.jetpackFuel = Math.max(0, previous.jetpackFuel - 1);
 }
 
-export function step(level: LevelT, state: PlayerState, input: InputState, context?: StepContext): StepResult {
+export function step(
+  level: LevelT,
+  state: PlayerState,
+  input: InputState,
+  context?: StepContext,
+): StepResult {
   const ctx = context ?? createStepContext(level);
   const previous = cloneState(state);
   const next = cloneState(state);
@@ -472,7 +491,13 @@ function compressExecuted(commands: InputCmd[]): InputCmd[] {
 export function simulate(level: LevelT, inputs: InputCmd[]): SimResult {
   const baseState = initialPlayerState(level);
   if (!baseState) {
-    return { ok: false, reason: 'no_spawn', frames: 0, path: [], fail: { at: { x: 0, y: level.exit.y } } };
+    return {
+      ok: false,
+      reason: 'no_spawn',
+      frames: 0,
+      path: [],
+      fail: { at: { x: 0, y: level.exit.y } },
+    };
   }
 
   const commands = mergeCommands(inputs);

@@ -181,7 +181,12 @@ function heuristic(state: PlayerState, exitX: number): number {
   return Math.max(0, (dx / MOVE_SPEED) * INPUT_HZ);
 }
 
-function advance(level: LevelT, context: ReturnType<typeof createStepContext>, state: PlayerState, input: InputState) {
+function advance(
+  level: LevelT,
+  context: ReturnType<typeof createStepContext>,
+  state: PlayerState,
+  input: InputState,
+) {
   let current = state;
   let hazard = false;
   for (let i = 0; i < ACTION_FRAMES; i += 1) {
@@ -217,7 +222,12 @@ function buildGapMap(level: LevelT): GapInfo[] {
   return gaps;
 }
 
-function violatesGap(state: PlayerState, gaps: GapInfo[], maxGap: number, allowFlight: boolean): boolean {
+function violatesGap(
+  state: PlayerState,
+  gaps: GapInfo[],
+  maxGap: number,
+  allowFlight: boolean,
+): boolean {
   if (allowFlight) {
     return false;
   }
@@ -232,7 +242,8 @@ function violatesGap(state: PlayerState, gaps: GapInfo[], maxGap: number, allowF
     if (state.x > gap.toX + 12) {
       continue;
     }
-    const verticalAligned = playerBottom <= gap.y + PLAYER_HEIGHT && playerBottom >= gap.y - PLAYER_HEIGHT * 2;
+    const verticalAligned =
+      playerBottom <= gap.y + PLAYER_HEIGHT && playerBottom >= gap.y - PLAYER_HEIGHT * 2;
     if (verticalAligned && state.x < gap.toX) {
       return true;
     }
@@ -251,7 +262,12 @@ function directionFor(input: InputState): number {
 }
 
 function buildExitRect(level: LevelT): Rect {
-  return { x: level.exit.x - PLAYER_WIDTH, y: level.exit.y - PLAYER_HEIGHT, w: PLAYER_WIDTH * 2, h: PLAYER_HEIGHT * 2 };
+  return {
+    x: level.exit.x - PLAYER_WIDTH,
+    y: level.exit.y - PLAYER_HEIGHT,
+    w: PLAYER_WIDTH * 2,
+    h: PLAYER_HEIGHT * 2,
+  };
 }
 
 function rectsOverlap(a: Rect, b: Rect): boolean {
@@ -302,11 +318,7 @@ export interface SearchOutcome {
   ms: number;
 }
 
-export function findPath(
-  level: LevelT,
-  timeLimitMs = 3000,
-  nodeLimit = 80000,
-): SearchOutcome {
+export function findPath(level: LevelT, timeLimitMs = 3000, nodeLimit = 80000): SearchOutcome {
   const start = initialPlayerState(level);
   if (!start) {
     return { ok: false, reason: 'no_spawn', nodes: 0, ms: 0 };

@@ -3,7 +3,7 @@ import Phaser from 'phaser';
 import { LevelT } from '@ir/game-spec';
 
 import { RUNNER_CONSTANTS } from '../types/game';
-import { fetchLevel } from '../level/loader';
+import { fetchLevel, fetchSeasonLevels, type SeasonLevelEntry } from '../level/loader';
 
 const DEFAULT_WORLD_HEIGHT = 720;
 const EXIT_WIDTH = 40;
@@ -22,6 +22,12 @@ export class GameScene extends Phaser.Scene {
   private levelData!: LevelT;
   private worldWidth = 0;
   private worldHeight = DEFAULT_WORLD_HEIGHT;
+
+  private seasonId = 'season-1';
+  private totalLevels = 100;
+  private currentLevelNumber = 1;
+  private currentLevelId: string | null = null;
+  private cachedSeasonLevels: SeasonLevelEntry[] = [];
 
   private player!: DynamicSprite;
   private platforms!: Phaser.Physics.Arcade.StaticGroup;
@@ -58,7 +64,9 @@ export class GameScene extends Phaser.Scene {
 
   private async initializeLevel(): Promise<void> {
     try {
-      this.levelData = await fetchLevel('demo');
+      const level = await this.loadLevelFor(this.currentLevelNumber);
+      this.levelData = level;
+      this.currentLevelId = level.id;
 
       this.setupInput();
       this.setupLevel();
@@ -179,6 +187,32 @@ export class GameScene extends Phaser.Scene {
     camera.setRoundPixels(true);
   }
 
+  private async loadLevelFor(levelNumber: number): Promise<LevelT> {
+    const entry = await this.findSeasonEntry(levelNumber);
+    if (entry?.levelId) {
+      return fetchLevel(entry.levelId);
+    }
+    return fetchLevel('demo');
+  }
+
+  private async findSeasonEntry(levelNumber: number): Promise<SeasonLevelEntry | null> {
+    const unpublished = await fetchSeasonLevels(this.seasonId, { published: false });
+    this.cachedSeasonLevels = unpublished;
+    const direct = unpublished.find(
+      (candidate) => candidate.levelNumber === levelNumber && typeof candidate.levelId === 'string',
+    );
+    if (direct) {
+      return direct;
+    }
+
+    const published = await fetchSeasonLevels(this.seasonId, { published: true });
+    this.cachedSeasonLevels = published;
+    const fallback = published.find(
+      (candidate) => candidate.levelNumber === levelNumber && typeof candidate.levelId === 'string',
+    );
+    return fallback ?? null;
+  }
+
   private setupHud(): void {
     this.hudText = this.add
       .text(16, 16, '', {
@@ -254,6 +288,7 @@ export class GameScene extends Phaser.Scene {
 
   private restartLevel(): void {
     this.isLevelReady = false;
+    this.cachedSeasonLevels = [];
     this.scene.restart();
   }
 
@@ -261,6 +296,11 @@ export class GameScene extends Phaser.Scene {
     const elapsed = this.getElapsedSeconds(this.time.now);
     console.info(`Level geschafft in ${elapsed.toFixed(2)}s`);
     this.isLevelReady = false;
+    if (this.currentLevelNumber < this.totalLevels) {
+      this.currentLevelNumber += 1;
+    }
+    this.currentLevelId = null;
+    this.cachedSeasonLevels = [];
     this.scene.restart();
   }
 
@@ -282,7 +322,11 @@ export class GameScene extends Phaser.Scene {
 
   private updateHud(time: number): void {
     const elapsed = this.getElapsedSeconds(time);
-    this.hudText.setText(`Level: ${this.levelData.id}\nTime: ${elapsed.toFixed(2)}s`);
+    const abilities = this.formatAbilities();
+    const levelLabel = this.currentLevelId ?? this.levelData.id;
+    this.hudText.setText(
+      `Level ${this.currentLevelNumber} / ${this.totalLevels}\nID: ${levelLabel}\nAbilities: ${abilities}\nTime: ${elapsed.toFixed(2)}s`,
+    );
   }
 
   private getElapsedSeconds(time: number): number {
@@ -323,5 +367,20 @@ export class GameScene extends Phaser.Scene {
     const sprite = group.create(tile.x + tile.w / 2, tile.y + tile.h / 2, texture) as StaticSprite;
     sprite.setDisplaySize(tile.w, tile.h);
     sprite.refreshBody();
+  }
+
+  private formatAbilities(): string {
+    const abilities = this.levelData.rules.abilities;
+    const entries: string[] = ['Jump'];
+    if (abilities.highJump) {
+      entries.push('HighJump');
+    }
+    if (abilities.shortFly) {
+      entries.push('Fly');
+    }
+    if (abilities.jetpack) {
+      entries.push(`Jetpack(${abilities.jetpack.fuel})`);
+    }
+    return entries.join(' · ');
   }
 }
