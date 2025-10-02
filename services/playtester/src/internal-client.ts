@@ -70,6 +70,8 @@ export async function updateJobStatus(params: {
   status: z.infer<typeof JobStatusSchema>;
   error?: string;
   levelId?: string;
+  attempts?: number;
+  lastReason?: string;
 }): Promise<void> {
   const response = await fetch(`${API_BASE_URL}/internal/jobs/${params.id}/status`, {
     method: 'POST',
@@ -81,6 +83,8 @@ export async function updateJobStatus(params: {
       status: JobStatusSchema.parse(params.status),
       error: params.error ?? null,
       levelId: params.levelId,
+      attempts: typeof params.attempts === 'number' ? params.attempts : undefined,
+      lastReason: params.lastReason,
     }),
   });
 
@@ -122,5 +126,31 @@ export async function submitLevelPath(params: { levelId: string; path: InputCmd[
   if (!response.ok) {
     const text = await response.text();
     throw new Error(`Failed to submit level path: ${response.status} ${text}`);
+  }
+}
+
+export async function submitLevelPatch(params: {
+  levelId: string;
+  patch: unknown;
+  reason: string;
+  level: LevelT;
+}): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/internal/levels/patch`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-internal-token': INTERNAL_TOKEN,
+    },
+    body: JSON.stringify({
+      level_id: params.levelId,
+      patch: params.patch,
+      reason: params.reason,
+      level: Level.parse(params.level),
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to submit level patch: ${response.status} ${text}`);
   }
 }

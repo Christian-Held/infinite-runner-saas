@@ -2,6 +2,10 @@ import type Database from 'better-sqlite3';
 
 import { closeDb, openDb } from './index';
 
+interface ColumnInfo {
+  name: string;
+}
+
 export async function migrate(db: Database.Database): Promise<void> {
   db.exec(`
     CREATE TABLE IF NOT EXISTS levels (
@@ -28,11 +32,23 @@ export async function migrate(db: Database.Database): Promise<void> {
       status TEXT NOT NULL,
       level_id TEXT,
       error TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_reason TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       FOREIGN KEY(level_id) REFERENCES levels(id)
     );
   `);
+
+  const jobColumns = db.prepare('PRAGMA table_info(jobs)').all() as ColumnInfo[];
+  const hasAttempts = jobColumns.some((column) => column.name === 'attempts');
+  const hasLastReason = jobColumns.some((column) => column.name === 'last_reason');
+  if (!hasAttempts) {
+    db.exec('ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!hasLastReason) {
+    db.exec('ALTER TABLE jobs ADD COLUMN last_reason TEXT');
+  }
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS level_paths (
@@ -40,6 +56,17 @@ export async function migrate(db: Database.Database): Promise<void> {
       path_json TEXT NOT NULL,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
+      FOREIGN KEY(level_id) REFERENCES levels(id)
+    );
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS level_revisions (
+      id TEXT PRIMARY KEY,
+      level_id TEXT NOT NULL,
+      patch_json TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
       FOREIGN KEY(level_id) REFERENCES levels(id)
     );
   `);
