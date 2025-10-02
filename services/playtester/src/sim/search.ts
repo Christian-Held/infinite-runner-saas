@@ -178,7 +178,7 @@ function stateKey(state: PlayerState, abilityMask: number): string {
 
 function heuristic(state: PlayerState, exitX: number): number {
   const dx = Math.max(0, exitX - state.x);
-  return (dx / MOVE_SPEED) * INPUT_HZ;
+  return Math.max(0, (dx / MOVE_SPEED) * INPUT_HZ);
 }
 
 function advance(level: LevelT, context: ReturnType<typeof createStepContext>, state: PlayerState, input: InputState) {
@@ -188,6 +188,9 @@ function advance(level: LevelT, context: ReturnType<typeof createStepContext>, s
     const { state: next, collidedHazard } = step(level, current, input, context);
     current = next;
     hazard ||= collidedHazard;
+    if (hazard) {
+      break;
+    }
   }
   return { next: current, hazard };
 }
@@ -334,12 +337,13 @@ export function findPath(
   queue.push(startNode);
   best.set(startKey, 0);
 
-  const started = Date.now();
+  const startTime = Date.now();
   let expanded = 0;
 
   while (queue.length > 0) {
-    if (Date.now() - started > timeLimitMs) {
-      return { ok: false, reason: 'timeout', nodes: expanded, ms: Date.now() - started };
+    const elapsed = Date.now() - startTime;
+    if (elapsed > timeLimitMs) {
+      return { ok: false, reason: 'timeout', nodes: expanded, ms: elapsed };
     }
 
     const current = queue.pop()!;
@@ -350,12 +354,12 @@ export function findPath(
 
     if (isGoal(current.state, exitRect)) {
       const path = reconstructPath(current);
-      return { ok: true, path, nodes: expanded, ms: Date.now() - started };
+      return { ok: true, path, nodes: expanded, ms: elapsed };
     }
 
     expanded += 1;
     if (expanded >= nodeLimit) {
-      return { ok: false, reason: 'node_limit', nodes: expanded, ms: Date.now() - started };
+      return { ok: false, reason: 'node_limit', nodes: expanded, ms: elapsed };
     }
 
     for (const action of actions) {
@@ -378,21 +382,17 @@ export function findPath(
 
       const dir = directionFor(action.input);
       const progress = Math.abs(next.x - current.state.x);
-      if (dir !== 0 && current.direction !== 0 && dir !== current.direction && progress < 12) {
+      const stalledProgress = progress < 1 ? current.stalled + 1 : 0;
+      if (
+        dir !== 0 &&
+        current.direction !== 0 &&
+        dir !== current.direction &&
+        current.stalled > 0 &&
+        current.stalled <= 3
+      ) {
         continue;
       }
-
-      let stalled = current.stalled;
-      if (progress < 4 && dir !== 0) {
-        stalled += 1;
-        if (stalled >= 3) {
-          continue;
-        }
-      } else if (progress < 2 && dir === 0) {
-        stalled = Math.min(3, stalled + 1);
-      } else {
-        stalled = 0;
-      }
+      const stalled = Math.min(4, stalledProgress);
 
       const nextKey = stateKey(next, abilityMask);
       const tentativeG = current.g + 1;
@@ -410,7 +410,7 @@ export function findPath(
         parent: current,
         action,
         key: nextKey,
-        direction: dir,
+        direction: dir !== 0 ? dir : current.direction,
         stalled,
       };
       queue.push(child);
@@ -418,5 +418,6 @@ export function findPath(
     }
   }
 
-  return { ok: false, reason: 'no_path', nodes: expanded, ms: Date.now() - started };
+  const elapsed = Date.now() - startTime;
+  return { ok: false, reason: 'no_path', nodes: expanded, ms: elapsed };
 }
