@@ -1,6 +1,8 @@
 import { Level, LevelT } from '@ir/game-spec';
 import { z } from 'zod';
 
+import { InputCmd } from './sim/arcade';
+
 const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN ?? 'dev-internal';
 const API_BASE_URL = process.env.API_BASE_URL ?? 'http://localhost:3000';
 
@@ -102,4 +104,23 @@ export async function fetchLevel(levelId: string): Promise<LevelT> {
 
   const data = await response.json();
   return Level.parse(data);
+}
+
+export async function submitLevelPath(params: { levelId: string; path: InputCmd[] }): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/internal/levels/path`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-internal-token': INTERNAL_TOKEN,
+    },
+    body: JSON.stringify({
+      level_id: params.levelId,
+      path: params.path,
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to submit level path: ${response.status} ${text}`);
+  }
 }

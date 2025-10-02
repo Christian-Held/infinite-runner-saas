@@ -51,3 +51,33 @@ export async function fetchLevel(id: string): Promise<LevelT> {
     return level;
   }
 }
+
+export interface LevelPathEntry {
+  t: number;
+  left?: boolean;
+  right?: boolean;
+  jump?: boolean;
+  fly?: boolean;
+  thrust?: boolean;
+}
+
+export async function fetchLevelPath(id: string): Promise<LevelPathEntry[] | null> {
+  const url = `${API_BASE_URL}/levels/${id}/path`;
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      if (response.status === 404) {
+        return null;
+      }
+      throw new Error(`Failed to load level path: ${response.status} ${response.statusText}`);
+    }
+    const payload = await response.json();
+    if (!Array.isArray(payload.path)) {
+      return null;
+    }
+    return payload.path as LevelPathEntry[];
+  } catch (error) {
+    console.warn(`Konnte Ghost-Path für Level ${id} nicht laden.`, error);
+    return null;
+  }
+}
