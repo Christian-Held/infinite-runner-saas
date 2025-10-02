@@ -34,3 +34,5 @@ coverage/
 
 # pnpm
 pnpm-lock.yaml
+**/.env
+!**/.env.example
