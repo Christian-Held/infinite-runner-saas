@@ -71,8 +71,32 @@ export async function migrate(db: Database.Database): Promise<void> {
     );
   `);
 
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS level_metrics (
+      level_id TEXT PRIMARY KEY,
+      score REAL NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY(level_id) REFERENCES levels(id)
+    );
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS season_jobs (
+      season_id TEXT NOT NULL,
+      level_number INTEGER NOT NULL,
+      job_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      level_id TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (season_id, level_number),
+      FOREIGN KEY(level_id) REFERENCES levels(id)
+    );
+  `);
+
   db.exec(`CREATE INDEX IF NOT EXISTS idx_levels_published ON levels(published);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_season_jobs_status ON season_jobs(status);`);
 
   console.log('migrate: ok');
 }

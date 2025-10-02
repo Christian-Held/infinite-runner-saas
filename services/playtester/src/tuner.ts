@@ -21,7 +21,7 @@ function finalizeLevel(level: LevelT, patch: { op: string; info: unknown }): Tun
   try {
     const validated = Level.parse(level);
     return { patched: validated, patch };
-  } catch (error) {
+  } catch {
     return null;
   }
 }
@@ -188,7 +188,9 @@ function adjustEnemy(level: LevelT, fail: Fail): TuneResult | null {
   if (typeof details.enemyIndex === 'number') {
     enemyIndex = details.enemyIndex;
   } else if (fail.at) {
-    const candidate = patched.enemies.findIndex((enemy) => Math.hypot(enemy.x - fail.at!.x, enemy.y - fail.at!.y) <= 96);
+    const candidate = patched.enemies.findIndex(
+      (enemy) => Math.hypot(enemy.x - fail.at!.x, enemy.y - fail.at!.y) <= 96,
+    );
     if (candidate >= 0) {
       enemyIndex = candidate;
     }
@@ -235,7 +237,9 @@ function addHelperPlatform(level: LevelT, fail: Fail): TuneResult | null {
   const patched = cloneLevel(level);
   const gap = ensureClosestGap(fail);
   const y = gap?.y ?? fail.at?.y ?? level.exit.y;
-  const x = gap ? gap.fromX + Math.max((gap.gap - PLATFORM_WIDTH) / 2, -PLATFORM_WIDTH / 2) : fail.at?.x ?? level.exit.x - PLATFORM_WIDTH;
+  const x = gap
+    ? gap.fromX + Math.max((gap.gap - PLATFORM_WIDTH) / 2, -PLATFORM_WIDTH / 2)
+    : (fail.at?.x ?? level.exit.x - PLATFORM_WIDTH);
   const tile: LevelT['tiles'][number] = {
     x: Math.round(x),
     y,

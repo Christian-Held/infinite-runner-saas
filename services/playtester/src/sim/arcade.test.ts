@@ -2,7 +2,15 @@ import assert from 'node:assert/strict';
 
 import { LevelT } from '@ir/game-spec';
 
-import { COYOTE_MS, PLAYER_HEIGHT, PLAYER_WIDTH, createStepContext, step, type InputState, type PlayerState } from './arcade';
+import {
+  COYOTE_MS,
+  PLAYER_HEIGHT,
+  PLAYER_WIDTH,
+  createStepContext,
+  step,
+  type InputState,
+  type PlayerState,
+} from './arcade';
 
 function buildTestLevel(): LevelT {
   return {

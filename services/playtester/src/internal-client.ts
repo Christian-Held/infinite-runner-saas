@@ -8,6 +8,7 @@ const API_BASE_URL = process.env.API_BASE_URL ?? 'http://localhost:3000';
 
 const JobStatusSchema = z.enum(['queued', 'running', 'failed', 'succeeded']);
 const JobTypeSchema = z.enum(['gen', 'test']);
+const SeasonJobStatusSchema = z.enum(['queued', 'running', 'failed', 'succeeded']);
 
 export interface IngestLevelPayload {
   level: LevelT;
@@ -110,7 +111,10 @@ export async function fetchLevel(levelId: string): Promise<LevelT> {
   return Level.parse(data);
 }
 
-export async function submitLevelPath(params: { levelId: string; path: InputCmd[] }): Promise<void> {
+export async function submitLevelPath(params: {
+  levelId: string;
+  path: InputCmd[];
+}): Promise<void> {
   const response = await fetch(`${API_BASE_URL}/internal/levels/path`, {
     method: 'POST',
     headers: {
@@ -152,5 +156,55 @@ export async function submitLevelPatch(params: {
   if (!response.ok) {
     const text = await response.text();
     throw new Error(`Failed to submit level patch: ${response.status} ${text}`);
+  }
+}
+
+export async function submitLevelMetrics(params: {
+  levelId: string;
+  score: number;
+}): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/internal/levels/metrics`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-internal-token': INTERNAL_TOKEN,
+    },
+    body: JSON.stringify({
+      level_id: params.levelId,
+      score: params.score,
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to submit level metrics: ${response.status} ${text}`);
+  }
+}
+
+export async function updateSeasonJobStatus(params: {
+  seasonId: string;
+  levelNumber: number;
+  status: z.infer<typeof SeasonJobStatusSchema>;
+  jobId?: string;
+  levelId?: string;
+}): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/internal/season-jobs/status`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-internal-token': INTERNAL_TOKEN,
+    },
+    body: JSON.stringify({
+      season_id: params.seasonId,
+      level_number: params.levelNumber,
+      status: SeasonJobStatusSchema.parse(params.status),
+      job_id: params.jobId,
+      level_id: params.levelId,
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to update season job: ${response.status} ${text}`);
   }
 }

@@ -5,7 +5,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { Ability } from '@ir/game-spec';
 import { z } from 'zod';
 
-import { insertJob, updateJobStatus } from '../db';
+import { insertJob, updateJobStatus, upsertSeasonJob } from '../db';
 
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
 
@@ -15,6 +15,8 @@ export interface GenJobData {
   seed?: string;
   difficulty?: number;
   abilities?: AbilityInput;
+  seasonId?: string;
+  levelNumber?: number;
 }
 
 export interface QueueManager {
@@ -43,6 +45,14 @@ export async function createQueueManager(): Promise<QueueManager> {
   async function enqueueGen(input: GenJobData): Promise<string> {
     const jobId = uuidv4();
     await insertJob({ id: jobId, type: 'gen', status: 'queued' });
+    if (input.seasonId && typeof input.levelNumber === 'number') {
+      upsertSeasonJob({
+        seasonId: input.seasonId,
+        levelNumber: input.levelNumber,
+        jobId,
+        status: 'queued',
+      });
+    }
     try {
       await genQueue.add('generate-level', input, { jobId });
     } catch (error) {
@@ -57,7 +67,7 @@ export async function createQueueManager(): Promise<QueueManager> {
     try {
       await connection.ping();
       return true;
-    } catch (error) {
+    } catch {
       return false;
     }
   }
@@ -66,7 +76,7 @@ export async function createQueueManager(): Promise<QueueManager> {
     await Promise.allSettled([genQueue.close()]);
     try {
       await connection.quit();
-    } catch (error) {
+    } catch {
       connection.disconnect();
     }
   }

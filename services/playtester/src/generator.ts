@@ -1,12 +1,14 @@
 import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { Ability, Level } from '@ir/game-spec';
+import { Ability, Level, getLevelPlan } from '@ir/game-spec';
 import stringify from 'fast-json-stable-stringify';
 import IORedis from 'ioredis';
 import OpenAI from 'openai';
 import seedrandom from 'seedrandom';
 import { z } from 'zod';
+
+import { scoreLevel, withinBand } from './scoring';
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL ?? 'gpt-4.1-mini';
 const OPENAI_REQ_TIMEOUT_MS = Number(process.env.OPENAI_REQ_TIMEOUT_MS ?? '20000');
@@ -67,22 +69,26 @@ interface PromptFragments {
 }
 
 class ParseError extends Error {
-  constructor(message: string, public readonly raw: string) {
+  constructor(
+    message: string,
+    public readonly raw: string,
+  ) {
     super(message);
     this.name = 'ParseError';
   }
 }
 
-function buildMiniExample(seed: string, difficulty: number, abilities: AbilityT): string {
+function buildMiniExample(
+  seed: string,
+  difficulty: number,
+  abilities: AbilityT,
+  constraints: GenerationConstraints,
+): string {
   const rng = seedrandom(`${seed}|${difficulty}`);
   const baseY = Math.round(rng() * 100) + 240;
-  const platformWidth = DEFAULT_CONSTRAINTS.minPlatformWidthPX +
-    Math.round(rng() * 32);
-  const gap = Math.min(
-    DEFAULT_CONSTRAINTS.maxGapPX - 10,
-    Math.round(rng() * DEFAULT_CONSTRAINTS.maxGapPX * 0.6),
-  );
-  const secondHeight = baseY - Math.round(rng() * (DEFAULT_CONSTRAINTS.maxStepUpPX - 12));
+  const platformWidth = constraints.minPlatformWidthPX + Math.round(rng() * 32);
+  const gap = Math.min(constraints.maxGapPX - 10, Math.round(rng() * constraints.maxGapPX * 0.6));
+  const secondHeight = baseY - Math.round(rng() * (constraints.maxStepUpPX - 12));
 
   const tiles = [
     {
@@ -131,6 +137,18 @@ export function makePrompt(
   abilities: AbilityT,
   constraints: GenerationConstraints,
   extraGuidance = '',
+  planDetails?: {
+    levelNumber: number;
+    difficultyTarget: number;
+    difficultyBand: [number, number];
+    limits: {
+      movingMax?: number;
+      enemyMax?: number;
+      hazardMax?: number;
+      jetpack?: { fuel: number; thrust: number } | undefined;
+    };
+    seasonId?: string;
+  },
 ): PromptFragments {
   const abilitySummary = JSON.stringify(abilities);
   const constraintLines = [
@@ -146,23 +164,43 @@ export function makePrompt(
     '- Abilities definieren erlaubte Elemente (keine Flugobjekte ohne passende Fähigkeit).',
   ];
 
-  const example = buildMiniExample(seed, difficulty, abilities);
+  const example = buildMiniExample(seed, difficulty, abilities, constraints);
 
   const userParts = [
     `Seed: ${seed}`,
     `Schwierigkeit: ${difficulty}`,
     `Abilities: ${abilitySummary}`,
-    'Constraints:',
-    ...constraintLines,
-    example,
   ];
+
+  if (planDetails) {
+    const [bandMin, bandMax] = planDetails.difficultyBand;
+    const limits = planDetails.limits;
+    const limitLines = [
+      `- Bewegliche Plattformen max.: ${typeof limits.movingMax === 'number' ? limits.movingMax : 'frei'}`,
+      `- Gegner max.: ${typeof limits.enemyMax === 'number' ? limits.enemyMax : 'frei'}`,
+      `- Gefahren max.: ${typeof limits.hazardMax === 'number' ? limits.hazardMax : 'sparsam'}`,
+    ];
+    if (limits.jetpack) {
+      limitLines.push(`- Jetpack-Fuel: ${limits.jetpack.fuel} (Thrust ${limits.jetpack.thrust})`);
+    }
+    userParts.push(
+      `Level-Nummer: ${planDetails.levelNumber} / 100`,
+      `Season: ${planDetails.seasonId ?? 'standalone'}`,
+      `Ziel-Schwierigkeitsscore: ${planDetails.difficultyTarget} (Band ${bandMin}-${bandMax})`,
+      'Grenzwerte für Inhalte:',
+      ...limitLines,
+    );
+  }
+
+  userParts.push('Constraints:', ...constraintLines, example);
 
   if (extraGuidance.trim().length > 0) {
     userParts.push('Feedback aus letzter Runde:', extraGuidance.trim());
   }
 
   return {
-    system: 'Antworte ausschließlich mit JSON, exakt nach Level-Schema. Keine Kommentare, kein Markdown.',
+    system:
+      'Antworte ausschließlich mit JSON, exakt nach Level-Schema. Keine Kommentare, kein Markdown.',
     user: userParts.join('\n'),
   };
 }
@@ -171,7 +209,7 @@ function extractJson(text: string): string | null {
   try {
     JSON.parse(text);
     return text;
-  } catch (error) {
+  } catch {
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
     if (start >= 0 && end > start) {
@@ -179,7 +217,7 @@ function extractJson(text: string): string | null {
       try {
         JSON.parse(candidate);
         return candidate;
-      } catch (error_) {
+      } catch {
         return null;
       }
     }
@@ -245,14 +283,34 @@ async function callModel(prompt: PromptFragments) {
 export async function generateLevel(
   seed: string,
   difficulty: number,
-  abilities: AbilityT,
+  abilities: AbilityT | undefined,
+  levelNumber?: number,
+  seasonId?: string,
 ): Promise<LevelShape> {
-  const parsedAbilities = AbilitySchema.parse(abilities);
+  const plan = getLevelPlan(levelNumber ?? 1);
+  const parsedAbilities = AbilitySchema.parse(abilities ?? plan.abilities);
+  const planConstraints: GenerationConstraints = {
+    ...DEFAULT_CONSTRAINTS,
+    maxGapPX: plan.constraints.maxGapPX,
+    minPlatformWidthPX: plan.constraints.minPlatformWidthPX,
+    maxStepUpPX: plan.constraints.maxStepUpPX,
+  };
   let guidance = '';
 
   for (let attempt = 0; attempt < GEN_MAX_ATTEMPTS; attempt += 1) {
     const attemptSeed = attempt === 0 ? seed : `${seed}-${attempt}`;
-    const prompt = makePrompt(attemptSeed, difficulty, parsedAbilities, DEFAULT_CONSTRAINTS, guidance);
+    const prompt = makePrompt(attemptSeed, difficulty, parsedAbilities, planConstraints, guidance, {
+      levelNumber: plan.levelNumber,
+      difficultyTarget: plan.difficultyTarget,
+      difficultyBand: plan.difficultyBand,
+      limits: {
+        movingMax: plan.constraints.movingMax,
+        enemyMax: plan.constraints.enemyMax,
+        hazardMax: plan.constraints.hazardMax,
+        jetpack: plan.constraints.jetpack,
+      },
+      seasonId,
+    });
 
     try {
       const raw = await callModel(prompt);
@@ -264,7 +322,7 @@ export async function generateLevel(
       let parsed: unknown;
       try {
         parsed = JSON.parse(candidateJson);
-      } catch (error) {
+      } catch {
         throw new ParseError('Antwort enthielt ungültiges JSON.', candidateJson);
       }
 
@@ -276,7 +334,7 @@ export async function generateLevel(
         id: `lvl-${attemptSeed}-${Date.now()}`,
         seed: attemptSeed,
         rules: {
-          duration_target_s: DEFAULT_CONSTRAINTS.targetDurationSec,
+          duration_target_s: planConstraints.targetDurationSec,
           difficulty,
           abilities: parsedAbilities,
           ...(typeof parsedObject.rules === 'object' && parsedObject.rules !== null
@@ -289,12 +347,21 @@ export async function generateLevel(
         candidateLevel.rules.difficulty = difficulty;
       }
       candidateLevel.rules.abilities = parsedAbilities;
-      candidateLevel.rules.duration_target_s = DEFAULT_CONSTRAINTS.targetDurationSec;
+      candidateLevel.rules.duration_target_s = planConstraints.targetDurationSec;
       candidateLevel.seed = attemptSeed;
+
+      const score = scoreLevel(candidateLevel);
+      if (!withinBand(score, plan.difficultyBand)) {
+        const direction = score < plan.difficultyTarget ? 'erhöhe' : 'reduziere';
+        guidance = `Schwierigkeitsscore ${score.toFixed(1)} außerhalb Zielband ${plan.difficultyBand[0]}-${plan.difficultyBand[1]} (Ziel ${plan.difficultyTarget}). Bitte ${direction} die Schwierigkeit durch Anpassungen an Lücken, Gegnern, beweglichen Plattformen oder Gefahren.`;
+        await delay(250);
+        continue;
+      }
 
       const signature = createSignature(candidateLevel);
       if (await isDuplicate(signature)) {
-        guidance = 'Vorherige Ausgabe duplizierte ein existierendes Layout. Variiere Struktur und Plattform-Anordnung.';
+        guidance =
+          'Vorherige Ausgabe duplizierte ein existierendes Layout. Variiere Struktur und Plattform-Anordnung.';
         continue;
       }
 
@@ -302,7 +369,8 @@ export async function generateLevel(
       return candidateLevel;
     } catch (error) {
       if (error instanceof ParseError) {
-        guidance = 'Die letzte Antwort war kein gültiges JSON. Gib ausschließlich gültiges JSON zurück.';
+        guidance =
+          'Die letzte Antwort war kein gültiges JSON. Gib ausschließlich gültiges JSON zurück.';
         await delay(250);
         continue;
       }
@@ -325,7 +393,7 @@ export async function closeGenerator(): Promise<void> {
 
   try {
     await redisClient.quit();
-  } catch (error) {
+  } catch {
     redisClient.disconnect();
   } finally {
     redisClient = null;

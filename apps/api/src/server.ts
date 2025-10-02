@@ -6,7 +6,7 @@ import pino from 'pino';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 
-import { Ability, Level } from '@ir/game-spec';
+import { Ability, Level, getLevelPlan } from '@ir/game-spec';
 
 import {
   getJob,
@@ -16,10 +16,15 @@ import {
   insertLevel,
   insertLevelRevision,
   listLevelRevisions,
+  listSeasonLevels,
   pingDb,
   updateLevel,
   upsertLevelPath,
   updateJobStatus,
+  updateSeasonJob,
+  upsertLevelMetric,
+  getLevelMetric,
+  getSeasonStatus,
 } from './db';
 import type { QueueManager } from './queue';
 
@@ -36,6 +41,16 @@ function requireInternalToken(request: FastifyRequest): void {
   if ((Array.isArray(token) ? token[0] : token) !== INTERNAL_TOKEN) {
     throw new Error('unauthorized');
   }
+}
+
+function extractParams(request: FastifyRequest): Record<string, unknown> {
+  const raw = request.params;
+  return raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+}
+
+function extractQuery(request: FastifyRequest): Record<string, unknown> {
+  const raw = request.query;
+  return raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
 }
 
 const GenerateBody = z.object({
@@ -88,6 +103,36 @@ const LevelPatchBody = z.object({
   level: Level,
 });
 
+const LevelMetricsBody = z.object({
+  level_id: z.string(),
+  score: z.number(),
+});
+
+const SeasonJobStatusEnum = z.enum(['queued', 'running', 'failed', 'succeeded']);
+
+const SeasonJobStatusBody = z.object({
+  season_id: z.string(),
+  level_number: z.number().int().min(1),
+  status: SeasonJobStatusEnum,
+  job_id: z.string().optional(),
+  level_id: z.string().optional(),
+});
+
+const SeasonBuildBody = z
+  .object({
+    seasonId: z.string(),
+    from: z.number().int().min(1).max(100).default(1),
+    to: z.number().int().min(1).max(100).default(100),
+  })
+  .refine((value) => value.to >= value.from, {
+    message: 'invalid_range',
+    path: ['to'],
+  });
+
+const SeasonLevelsQuery = z.object({
+  published: z.enum(['true', 'false']).optional(),
+});
+
 export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
   const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
   const server = Fastify({ logger });
@@ -130,8 +175,30 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
     reply.status(202).send({ job_id: jobId });
   });
 
+  server.post('/seasons/build', async (request, reply) => {
+    const body = SeasonBuildBody.parse(request.body ?? {});
+    const from = body.from ?? 1;
+    const to = body.to ?? 100;
+    let count = 0;
+
+    for (let levelNumber = from; levelNumber <= to; levelNumber += 1) {
+      const plan = getLevelPlan(levelNumber);
+      await queueManager.enqueueGen({
+        seed: undefined,
+        difficulty: plan.difficultyTarget,
+        abilities: plan.abilities,
+        seasonId: body.seasonId,
+        levelNumber,
+      });
+      count += 1;
+    }
+
+    reply.status(202).send({ seasonId: body.seasonId, count });
+  });
+
   server.get('/levels/:id', async (request, reply) => {
-    const id = z.string().parse((request.params as any).id);
+    const params = extractParams(request);
+    const id = z.string().parse(params.id);
     const level = getLevel(id);
     if (!level) {
       reply.status(404).send({ error: 'not_found' });
@@ -140,8 +207,20 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
     reply.send(level);
   });
 
+  server.get('/levels/:id/metrics', async (request, reply) => {
+    const params = extractParams(request);
+    const id = z.string().parse(params.id);
+    const metric = getLevelMetric(id);
+    if (!metric) {
+      reply.status(404).send({ error: 'not_found' });
+      return;
+    }
+    reply.send({ level_id: metric.levelId, score: metric.score, created_at: metric.createdAt });
+  });
+
   server.get('/levels/:id/path', async (request, reply) => {
-    const id = z.string().parse((request.params as any).id);
+    const params = extractParams(request);
+    const id = z.string().parse(params.id);
     const level = getLevel(id);
     if (!level) {
       reply.status(404).send({ error: 'not_found' });
@@ -157,7 +236,8 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
   });
 
   server.get('/levels/:id/revisions', async (request, reply) => {
-    const id = z.string().parse((request.params as any).id);
+    const params = extractParams(request);
+    const id = z.string().parse(params.id);
     const level = getLevel(id);
     if (!level) {
       reply.status(404).send({ error: 'not_found' });
@@ -168,7 +248,8 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
   });
 
   server.get('/jobs/:id', async (request, reply) => {
-    const id = z.string().parse((request.params as any).id);
+    const params = extractParams(request);
+    const id = z.string().parse(params.id);
     const job = getJob(id);
     if (!job) {
       reply.status(404).send({ error: 'not_found' });
@@ -177,10 +258,26 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
     reply.send(job);
   });
 
+  server.get('/seasons/:id/status', async (request, reply) => {
+    const params = extractParams(request);
+    const seasonId = z.string().parse(params.id);
+    const status = getSeasonStatus(seasonId);
+    reply.send(status);
+  });
+
+  server.get('/seasons/:id/levels', async (request, reply) => {
+    const params = extractParams(request);
+    const seasonId = z.string().parse(params.id);
+    const query = SeasonLevelsQuery.parse(extractQuery(request));
+    const published = typeof query.published === 'string' ? query.published === 'true' : undefined;
+    const levels = listSeasonLevels({ seasonId, published });
+    reply.send({ seasonId, levels });
+  });
+
   server.post('/internal/levels', async (request, reply) => {
     try {
       requireInternalToken(request);
-    } catch (error) {
+    } catch {
       reply.status(401).send({ error: 'unauthorized' });
       return;
     }
@@ -193,25 +290,31 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
   server.post('/internal/jobs', async (request, reply) => {
     try {
       requireInternalToken(request);
-    } catch (error) {
+    } catch {
       reply.status(401).send({ error: 'unauthorized' });
       return;
     }
 
     const body = InternalJobBody.parse(request.body ?? {});
-    insertJob({ id: body.id, type: body.type, status: body.status, level_id: body.levelId ?? null });
+    insertJob({
+      id: body.id,
+      type: body.type,
+      status: body.status,
+      level_id: body.levelId ?? null,
+    });
     reply.status(204).send();
   });
 
   server.post('/internal/jobs/:id/status', async (request, reply) => {
     try {
       requireInternalToken(request);
-    } catch (error) {
+    } catch {
       reply.status(401).send({ error: 'unauthorized' });
       return;
     }
 
-    const id = z.string().parse((request.params as any).id);
+    const params = extractParams(request);
+    const id = z.string().parse(params.id);
     const body = UpdateJobBody.parse(request.body ?? {});
     updateJobStatus(id, body.status, {
       error: body.error ?? undefined,
@@ -225,7 +328,7 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
   server.post('/internal/levels/path', async (request, reply) => {
     try {
       requireInternalToken(request);
-    } catch (error) {
+    } catch {
       reply.status(401).send({ error: 'unauthorized' });
       return;
     }
@@ -241,10 +344,48 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
     reply.status(204).send();
   });
 
+  server.post('/internal/levels/metrics', async (request, reply) => {
+    try {
+      requireInternalToken(request);
+    } catch {
+      reply.status(401).send({ error: 'unauthorized' });
+      return;
+    }
+
+    const body = LevelMetricsBody.parse(request.body ?? {});
+    const level = getLevel(body.level_id);
+    if (!level) {
+      reply.status(404).send({ error: 'level_not_found' });
+      return;
+    }
+
+    upsertLevelMetric(body.level_id, body.score);
+    reply.status(204).send();
+  });
+
+  server.post('/internal/season-jobs/status', async (request, reply) => {
+    try {
+      requireInternalToken(request);
+    } catch {
+      reply.status(401).send({ error: 'unauthorized' });
+      return;
+    }
+
+    const body = SeasonJobStatusBody.parse(request.body ?? {});
+    updateSeasonJob({
+      seasonId: body.season_id,
+      levelNumber: body.level_number,
+      status: body.status,
+      jobId: body.job_id,
+      levelId: body.level_id,
+    });
+    reply.status(204).send();
+  });
+
   server.post('/internal/levels/patch', async (request, reply) => {
     try {
       requireInternalToken(request);
-    } catch (error) {
+    } catch {
       reply.status(401).send({ error: 'unauthorized' });
       return;
     }
@@ -263,7 +404,12 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
     }
 
     const revisionId = randomUUID();
-    insertLevelRevision({ id: revisionId, levelId: body.level_id, patch: body.patch, reason: body.reason });
+    insertLevelRevision({
+      id: revisionId,
+      levelId: body.level_id,
+      patch: body.patch,
+      reason: body.reason,
+    });
     updateLevel(parsedLevel);
     reply.status(201).send({ id: revisionId });
   });
