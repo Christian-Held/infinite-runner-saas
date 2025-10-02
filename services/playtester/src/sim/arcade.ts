@@ -45,12 +45,6 @@ export interface PlayerState {
   furthestX: number;
 }
 
-export interface StepContext {
-  abilities: LevelT['rules']['abilities'];
-  solids: Rect[];
-  hazards: Rect[];
-}
-
 interface Rect {
   x: number;
   y: number;
@@ -61,6 +55,13 @@ interface Rect {
 interface StepResult {
   state: PlayerState;
   collidedHazard: boolean;
+}
+
+export interface StepContext {
+  abilities: LevelT['rules']['abilities'];
+  ground: Rect[];
+  platforms: Rect[];
+  hazards: Rect[];
 }
 
 export interface SimResult {
@@ -132,13 +133,21 @@ function mergeCommands(commands: InputCmd[]): InputCmd[] {
 }
 
 export function createStepContext(level: LevelT): StepContext {
-  const solids = level.tiles
-    .filter((tile) => WALKABLE_TYPES.includes(tile.type))
-    .map((tile) => ({ x: tile.x, y: tile.y, w: tile.w, h: tile.h }));
-  const hazards = level.tiles
-    .filter((tile) => tile.type === 'hazard')
-    .map((tile) => ({ x: tile.x, y: tile.y, w: tile.w, h: tile.h }));
-  return { abilities: level.rules.abilities, solids, hazards };
+  const ground: Rect[] = [];
+  const platforms: Rect[] = [];
+  const hazards: Rect[] = [];
+
+  for (const tile of level.tiles) {
+    if (tile.type === 'ground') {
+      ground.push({ x: tile.x, y: tile.y, w: tile.w, h: tile.h });
+    } else if (tile.type === 'platform') {
+      platforms.push({ x: tile.x, y: tile.y, w: tile.w, h: tile.h });
+    } else if (tile.type === 'hazard') {
+      hazards.push({ x: tile.x, y: tile.y, w: tile.w, h: tile.h });
+    }
+  }
+
+  return { abilities: level.rules.abilities, ground, platforms, hazards };
 }
 
 function rectsOverlap(a: Rect, b: Rect): boolean {
@@ -176,7 +185,7 @@ export function initialPlayerState(level: LevelT): PlayerState | null {
     vx: 0,
     vy: 0,
     onGround: true,
-    coyoteTimerMs: 0,
+    coyoteTimerMs: COYOTE_MS,
     jumpBufferMs: 0,
     shortFlyAvailable: true,
     jetpackFuel,
@@ -184,82 +193,173 @@ export function initialPlayerState(level: LevelT): PlayerState | null {
   };
 }
 
-function resolveVerticalMovement(
-  previous: PlayerState,
-  next: PlayerState,
-  context: StepContext,
-  nextX: number,
-): { y: number; onGround: boolean } {
-  const prevBottom = previous.y + PLAYER_HEIGHT;
-  const nextY = previous.y + next.vy * DT;
-  const nextBottom = nextY + PLAYER_HEIGHT;
-  let resolvedY = nextY;
-  let grounded = false;
+function verticalOverlap(y: number, h: number, tile: Rect): boolean {
+  return y < tile.y + tile.h && y + h > tile.y;
+}
 
-  if (next.vy >= 0) {
-    for (const tile of context.solids) {
-      const tileTop = tile.y;
-      const horizontalOverlap = nextX + PLAYER_WIDTH > tile.x && nextX < tile.x + tile.w;
-      if (!horizontalOverlap) {
-        continue;
-      }
-      if (prevBottom <= tileTop && nextBottom >= tileTop) {
-        resolvedY = tileTop - PLAYER_HEIGHT;
-        grounded = true;
-        next.vy = 0;
-        break;
+function resolveHorizontalCollisions(
+  previous: PlayerState,
+  targetX: number,
+  vx: number,
+  ctx: StepContext,
+): { x: number; vx: number } {
+  if (vx === 0) {
+    return { x: previous.x, vx: 0 };
+  }
+
+  const tiles = [...ctx.ground, ...ctx.platforms];
+  const overlapping = tiles.filter((tile) => verticalOverlap(previous.y, PLAYER_HEIGHT, tile));
+  let resolvedX = targetX;
+  let resolvedVx = vx;
+
+  if (vx > 0) {
+    let minX = targetX;
+    for (const tile of overlapping) {
+      const prevRight = previous.x + PLAYER_WIDTH;
+      const tileLeft = tile.x;
+      if (prevRight <= tileLeft && targetX + PLAYER_WIDTH > tileLeft) {
+        const candidate = tileLeft - PLAYER_WIDTH;
+        if (candidate < minX) {
+          minX = candidate;
+        }
+      } else if (rectsOverlap({ x: targetX, y: previous.y, w: PLAYER_WIDTH, h: PLAYER_HEIGHT }, tile)) {
+        const candidate = tileLeft - PLAYER_WIDTH;
+        if (candidate < minX) {
+          minX = candidate;
+        }
       }
     }
+    if (minX < targetX) {
+      resolvedX = minX;
+      resolvedVx = 0;
+    }
   } else {
-    for (const tile of context.solids) {
-      const tileBottom = tile.y + tile.h;
-      const horizontalOverlap = previous.x + PLAYER_WIDTH > tile.x && previous.x < tile.x + tile.w;
-      if (!horizontalOverlap) {
-        continue;
+    let maxX = targetX;
+    for (const tile of overlapping) {
+      const prevLeft = previous.x;
+      const tileRight = tile.x + tile.w;
+      if (prevLeft >= tileRight && targetX < tileRight) {
+        const candidate = tileRight;
+        if (candidate > maxX) {
+          maxX = candidate;
+        }
+      } else if (rectsOverlap({ x: targetX, y: previous.y, w: PLAYER_WIDTH, h: PLAYER_HEIGHT }, tile)) {
+        const candidate = tileRight;
+        if (candidate > maxX) {
+          maxX = candidate;
+        }
       }
-      if (previous.y >= tileBottom && nextY <= tileBottom) {
-        resolvedY = tileBottom;
-        next.vy = 0;
-        break;
-      }
+    }
+    if (maxX > targetX) {
+      resolvedX = maxX;
+      resolvedVx = 0;
     }
   }
 
-  return { y: resolvedY, onGround: grounded };
+  return { x: resolvedX, vx: resolvedVx };
 }
 
-function applyJump(previous: PlayerState, next: PlayerState, context: StepContext): void {
-  const jumpStrength = context.abilities.highJump ? JUMP_VY * 1.2 : JUMP_VY;
-  next.vy = jumpStrength;
+function resolveVerticalCollisions(
+  previous: PlayerState,
+  targetY: number,
+  currentX: number,
+  vy: number,
+  ctx: StepContext,
+): { y: number; vy: number; onGround: boolean } {
+  let resolvedY = targetY;
+  let resolvedVy = vy;
+  let onGround = false;
+
+  const playerRect = (y: number): Rect => ({ x: currentX, y, w: PLAYER_WIDTH, h: PLAYER_HEIGHT });
+
+  if (vy > 0) {
+    let landingY = targetY;
+    let landed = false;
+    for (const tile of [...ctx.ground, ...ctx.platforms]) {
+      if (!rectsOverlap(playerRect(targetY), tile)) {
+        continue;
+      }
+      const prevBottom = previous.y + PLAYER_HEIGHT;
+      const nextBottom = targetY + PLAYER_HEIGHT;
+      const tileTop = tile.y;
+      if (prevBottom > tileTop + 0.01) {
+        continue;
+      }
+      if (nextBottom < tileTop) {
+        continue;
+      }
+      const candidate = tileTop - PLAYER_HEIGHT;
+      if (!landed || candidate < landingY) {
+        landingY = candidate;
+        landed = true;
+      }
+    }
+    if (landed) {
+      resolvedY = landingY;
+      resolvedVy = 0;
+      onGround = true;
+    }
+  } else if (vy < 0) {
+    let ceilingY = targetY;
+    let bumped = false;
+    for (const tile of ctx.ground) {
+      if (!rectsOverlap(playerRect(targetY), tile)) {
+        continue;
+      }
+      const prevTop = previous.y;
+      const nextTop = targetY;
+      const tileBottom = tile.y + tile.h;
+      if (prevTop < tileBottom - 0.01) {
+        continue;
+      }
+      if (nextTop > tileBottom) {
+        continue;
+      }
+      const candidate = tileBottom;
+      if (!bumped || candidate > ceilingY) {
+        ceilingY = candidate;
+        bumped = true;
+      }
+    }
+    if (bumped) {
+      resolvedY = ceilingY;
+      resolvedVy = 0;
+    }
+  }
+
+  return { y: resolvedY, vy: resolvedVy, onGround };
+}
+
+function applyJump(
+  previous: PlayerState,
+  next: PlayerState,
+  ctx: StepContext,
+  useHighJump: boolean,
+): void {
+  const base = useHighJump ? JUMP_VY * 1.2 : JUMP_VY;
+  next.vy = base;
   next.onGround = false;
   next.coyoteTimerMs = 0;
   next.jumpBufferMs = 0;
-  if (context.abilities.shortFly) {
-    next.shortFlyAvailable = false;
-  }
 }
 
-function applyShortFly(previous: PlayerState, next: PlayerState, context: StepContext, input: InputState): void {
-  if (!context.abilities.shortFly) {
+function applyShortFly(previous: PlayerState, next: PlayerState, ctx: StepContext, input: InputState): void {
+  if (!ctx.abilities.shortFly) {
     return;
   }
-  if (!input.fly || previous.onGround || !previous.shortFlyAvailable) {
+  if (previous.onGround || !input.fly || !previous.shortFlyAvailable) {
     return;
   }
-
   next.vy = Math.min(next.vy, JUMP_VY * 0.6);
   next.shortFlyAvailable = false;
 }
 
-function applyJetpack(previous: PlayerState, next: PlayerState, context: StepContext, input: InputState): void {
-  if (!context.abilities.jetpack) {
+function applyJetpack(previous: PlayerState, next: PlayerState, ctx: StepContext, input: InputState): void {
+  if (!ctx.abilities.jetpack || !input.thrust || previous.jetpackFuel <= 0) {
+    next.jetpackFuel = previous.jetpackFuel;
     return;
   }
-  if (!input.thrust || previous.jetpackFuel <= 0) {
-    return;
-  }
-
-  next.vy += context.abilities.jetpack.thrust * DT;
+  next.vy += ctx.abilities.jetpack.thrust * DT;
   next.jetpackFuel = Math.max(0, previous.jetpackFuel - 1);
 }
 
@@ -295,26 +395,30 @@ export function step(level: LevelT, state: PlayerState, input: InputState, conte
   next.onGround = previous.onGround;
   next.vy = previous.vy;
 
-  if (next.jumpBufferMs > 0 && (previous.onGround || previous.coyoteTimerMs > 0)) {
-    applyJump(previous, next, ctx);
+  const canJump = (previous.onGround || previous.coyoteTimerMs > 0) && next.jumpBufferMs > 0;
+  if (canJump) {
+    const useHighJump = Boolean(ctx.abilities.highJump);
+    applyJump(previous, next, ctx, useHighJump);
   }
 
   applyShortFly(previous, next, ctx, input);
   applyJetpack(previous, next, ctx, input);
 
+  const horizontalTargetX = previous.x + next.vx * DT;
+  const horizontalResult = resolveHorizontalCollisions(previous, horizontalTargetX, next.vx, ctx);
+  next.x = horizontalResult.x;
+  next.vx = horizontalResult.vx;
+
   next.vy += GRAVITY_Y * DT;
 
-  const nextX = previous.x + next.vx * DT;
-  const vertical = resolveVerticalMovement(previous, next, ctx, nextX);
-  next.x = nextX;
-  next.y = vertical.y;
-  next.onGround = vertical.onGround;
-
-  if (!next.onGround && next.coyoteTimerMs > 0) {
-    next.coyoteTimerMs = Math.max(0, next.coyoteTimerMs - DT * 1000);
-  }
+  const verticalTargetY = previous.y + next.vy * DT;
+  const verticalResult = resolveVerticalCollisions(previous, verticalTargetY, next.x, next.vy, ctx);
+  next.y = verticalResult.y;
+  next.vy = verticalResult.vy;
+  next.onGround = verticalResult.onGround;
 
   if (next.onGround) {
+    next.coyoteTimerMs = COYOTE_MS;
     next.shortFlyAvailable = true;
   }
 
@@ -327,7 +431,12 @@ export function step(level: LevelT, state: PlayerState, input: InputState, conte
 }
 
 function buildExitRect(level: LevelT): Rect {
-  return { x: level.exit.x - PLAYER_WIDTH, y: level.exit.y - PLAYER_HEIGHT, w: PLAYER_WIDTH * 2, h: PLAYER_HEIGHT * 2 };
+  return {
+    x: level.exit.x - PLAYER_WIDTH,
+    y: level.exit.y - PLAYER_HEIGHT,
+    w: PLAYER_WIDTH * 2,
+    h: PLAYER_HEIGHT * 2,
+  };
 }
 
 function compressExecuted(commands: InputCmd[]): InputCmd[] {
