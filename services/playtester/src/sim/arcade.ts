@@ -1,6 +1,10 @@
 import { LevelT } from '@ir/game-spec';
 
-export const DT = 1 / 60;
+export const TICK_HZ = 60;
+export const DT = 1 / TICK_HZ;
+export const INPUT_HZ = 30;
+const INPUT_FRAME_INTERVAL = TICK_HZ / INPUT_HZ;
+
 export const GRAVITY_Y = 1200;
 export const MOVE_SPEED = 180;
 export const JUMP_VY = -520;
@@ -10,16 +14,14 @@ export const JUMPBUFFER_MS = 100;
 export const PLAYER_WIDTH = 24;
 export const PLAYER_HEIGHT = 32;
 
-export type GridHash = Set<string>;
-
-export interface InputCmd {
+export type InputCmd = {
   t: number;
   left?: boolean;
   right?: boolean;
   jump?: boolean;
   fly?: boolean;
   thrust?: boolean;
-}
+};
 
 export interface InputState {
   left: boolean;
@@ -40,31 +42,13 @@ export interface PlayerState {
   jumpBufferMs: number;
   shortFlyAvailable: boolean;
   jetpackFuel: number;
+  furthestX: number;
 }
 
 export interface StepContext {
   abilities: LevelT['rules']['abilities'];
-  tiles: LevelT['tiles'];
-  hazards: LevelT['tiles'];
-}
-
-export interface StepResult extends PlayerState {
-  collidedHazard: boolean;
-  terminated: boolean;
-}
-
-export interface SpawnInfo {
-  x: number;
-  y: number;
-}
-
-export interface SimResult {
-  ok: boolean;
-  reason?: string;
-  frames: number;
-  x: number;
-  y: number;
-  visited: GridHash;
+  solids: Rect[];
+  hazards: Rect[];
 }
 
 interface Rect {
@@ -74,34 +58,96 @@ interface Rect {
   h: number;
 }
 
+interface StepResult {
+  state: PlayerState;
+  collidedHazard: boolean;
+}
+
+export interface SimResult {
+  ok: boolean;
+  frames: number;
+  reason?: string;
+  path: InputCmd[];
+}
+
+const WALKABLE_TYPES: LevelT['tiles'][number]['type'][] = ['ground', 'platform'];
+
+function cloneState(state: PlayerState): PlayerState {
+  return { ...state };
+}
+
+function defaultInput(): InputState {
+  return { left: false, right: false, jump: false, fly: false, thrust: false };
+}
+
+function applyCommand(previous: InputState, command?: InputCmd): InputState {
+  if (!command) {
+    return { ...previous };
+  }
+  const next = { ...previous };
+  if ('left' in command) {
+    next.left = Boolean(command.left);
+  }
+  if ('right' in command) {
+    next.right = Boolean(command.right);
+  }
+  if ('jump' in command) {
+    next.jump = Boolean(command.jump);
+  }
+  if ('fly' in command) {
+    next.fly = Boolean(command.fly);
+  }
+  if ('thrust' in command) {
+    next.thrust = Boolean(command.thrust);
+  }
+  return next;
+}
+
+function mergeCommands(commands: InputCmd[]): InputCmd[] {
+  const map = new Map<number, InputCmd>();
+  for (const command of commands) {
+    if (command.t < 0) {
+      continue;
+    }
+    const existing = map.get(command.t) ?? { t: command.t };
+    const merged: InputCmd = { ...existing };
+    if ('left' in command) {
+      merged.left = command.left;
+    }
+    if ('right' in command) {
+      merged.right = command.right;
+    }
+    if ('jump' in command) {
+      merged.jump = command.jump;
+    }
+    if ('fly' in command) {
+      merged.fly = command.fly;
+    }
+    if ('thrust' in command) {
+      merged.thrust = command.thrust;
+    }
+    map.set(command.t, merged);
+  }
+  return Array.from(map.values()).sort((a, b) => a.t - b.t);
+}
+
+export function createStepContext(level: LevelT): StepContext {
+  const solids = level.tiles
+    .filter((tile) => WALKABLE_TYPES.includes(tile.type))
+    .map((tile) => ({ x: tile.x, y: tile.y, w: tile.w, h: tile.h }));
+  const hazards = level.tiles
+    .filter((tile) => tile.type === 'hazard')
+    .map((tile) => ({ x: tile.x, y: tile.y, w: tile.w, h: tile.h }));
+  return { abilities: level.rules.abilities, solids, hazards };
+}
+
 function rectsOverlap(a: Rect, b: Rect): boolean {
-  return a.x < b.x + b.w &&
-    a.x + a.w > b.x &&
-    a.y < b.y + b.h &&
-    a.y + a.h > b.y;
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
 }
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
-}
-
-function normaliseInput(input?: InputCmd): InputState {
-  return {
-    left: Boolean(input?.left),
-    right: Boolean(input?.right),
-    jump: Boolean(input?.jump),
-    fly: Boolean(input?.fly),
-    thrust: Boolean(input?.thrust),
-  };
-}
-
-function quantisePosition(value: number): number {
-  return Math.round(value / 2) * 2;
-}
-
-export function createSpawn(level: LevelT): SpawnInfo | null {
+export function createSpawn(level: LevelT): { x: number; y: number } | null {
   const walkable = level.tiles
-    .filter((tile) => tile.type === 'ground' || tile.type === 'platform')
+    .filter((tile) => WALKABLE_TYPES.includes(tile.type))
     .sort((a, b) => a.x - b.x);
 
   const first = walkable[0];
@@ -109,9 +155,8 @@ export function createSpawn(level: LevelT): SpawnInfo | null {
     return null;
   }
 
-  const spawnX = first.x + Math.min(32, Math.max(8, PLAYER_WIDTH));
+  const spawnX = first.x + Math.min(Math.max(PLAYER_WIDTH, 16), first.w / 2);
   const spawnY = first.y - PLAYER_HEIGHT;
-
   return { x: spawnX, y: spawnY };
 }
 
@@ -124,221 +169,235 @@ export function initialPlayerState(level: LevelT): PlayerState | null {
   const abilities = level.rules.abilities;
   const jetpackFuel = abilities.jetpack ? abilities.jetpack.fuel : 0;
 
-  const tiles = level.tiles.filter((tile) => tile.type === 'ground' || tile.type === 'platform');
-  const playerRect: Rect = { x: spawn.x, y: spawn.y, w: PLAYER_WIDTH, h: PLAYER_HEIGHT };
-  const onGround = tiles.some((tile) => {
-    const isBelow = Math.abs(playerRect.y + playerRect.h - tile.y) <= 1;
-    const horizontalOverlap = playerRect.x + playerRect.w > tile.x && playerRect.x < tile.x + tile.w;
-    return isBelow && horizontalOverlap;
-  });
-
   return {
     frame: 0,
     x: spawn.x,
     y: spawn.y,
     vx: 0,
     vy: 0,
-    onGround,
+    onGround: true,
     coyoteTimerMs: 0,
     jumpBufferMs: 0,
     shortFlyAvailable: true,
     jetpackFuel,
+    furthestX: spawn.x,
   };
 }
 
-function resolveHorizontalCollisions(state: PlayerState, tiles: Rect[]): void {
-  if (state.vx === 0) {
-    return;
-  }
+function resolveVerticalMovement(
+  previous: PlayerState,
+  next: PlayerState,
+  context: StepContext,
+  nextX: number,
+): { y: number; onGround: boolean } {
+  const prevBottom = previous.y + PLAYER_HEIGHT;
+  const nextY = previous.y + next.vy * DT;
+  const nextBottom = nextY + PLAYER_HEIGHT;
+  let resolvedY = nextY;
+  let grounded = false;
 
-  const nextX = state.x + state.vx * DT;
-  const playerRect: Rect = { x: nextX, y: state.y, w: PLAYER_WIDTH, h: PLAYER_HEIGHT };
-
-  for (const tile of tiles) {
-    if (rectsOverlap(playerRect, tile)) {
-      if (state.vx > 0) {
-        playerRect.x = tile.x - PLAYER_WIDTH;
-      } else if (state.vx < 0) {
-        playerRect.x = tile.x + tile.w;
+  if (next.vy >= 0) {
+    for (const tile of context.solids) {
+      const tileTop = tile.y;
+      const horizontalOverlap = nextX + PLAYER_WIDTH > tile.x && nextX < tile.x + tile.w;
+      if (!horizontalOverlap) {
+        continue;
       }
-      state.vx = 0;
+      if (prevBottom <= tileTop && nextBottom >= tileTop) {
+        resolvedY = tileTop - PLAYER_HEIGHT;
+        grounded = true;
+        next.vy = 0;
+        break;
+      }
+    }
+  } else {
+    for (const tile of context.solids) {
+      const tileBottom = tile.y + tile.h;
+      const horizontalOverlap = previous.x + PLAYER_WIDTH > tile.x && previous.x < tile.x + tile.w;
+      if (!horizontalOverlap) {
+        continue;
+      }
+      if (previous.y >= tileBottom && nextY <= tileBottom) {
+        resolvedY = tileBottom;
+        next.vy = 0;
+        break;
+      }
     }
   }
 
-  state.x = playerRect.x;
+  return { y: resolvedY, onGround: grounded };
 }
 
-function resolveVerticalCollisions(state: PlayerState, tiles: Rect[]): void {
-  const nextY = state.y + state.vy * DT;
-  const playerRect: Rect = { x: state.x, y: nextY, w: PLAYER_WIDTH, h: PLAYER_HEIGHT };
-
-  let onGround = false;
-
-  for (const tile of tiles) {
-    if (!rectsOverlap(playerRect, tile)) {
-      continue;
-    }
-
-    if (state.vy > 0) {
-      playerRect.y = tile.y - PLAYER_HEIGHT;
-      state.vy = 0;
-      onGround = true;
-    } else if (state.vy < 0) {
-      playerRect.y = tile.y + tile.h;
-      state.vy = 0;
-    }
-  }
-
-  state.y = playerRect.y;
-  state.onGround = onGround;
-}
-
-function applyJump(state: PlayerState, abilities: LevelT['rules']['abilities']): void {
-  if (state.jumpBufferMs <= 0) {
-    return;
-  }
-  if (!state.onGround && state.coyoteTimerMs <= 0) {
-    return;
-  }
-
-  const jumpStrength = abilities.highJump ? JUMP_VY * 1.2 : JUMP_VY;
-
-  state.vy = jumpStrength;
-  state.onGround = false;
-  state.coyoteTimerMs = 0;
-  state.jumpBufferMs = 0;
-  if (abilities.shortFly) {
-    state.shortFlyAvailable = false;
+function applyJump(previous: PlayerState, next: PlayerState, context: StepContext): void {
+  const jumpStrength = context.abilities.highJump ? JUMP_VY * 1.2 : JUMP_VY;
+  next.vy = jumpStrength;
+  next.onGround = false;
+  next.coyoteTimerMs = 0;
+  next.jumpBufferMs = 0;
+  if (context.abilities.shortFly) {
+    next.shortFlyAvailable = false;
   }
 }
 
-function applyShortFly(state: PlayerState, abilities: LevelT['rules']['abilities'], input: InputState): void {
-  if (!abilities.shortFly) {
+function applyShortFly(previous: PlayerState, next: PlayerState, context: StepContext, input: InputState): void {
+  if (!context.abilities.shortFly) {
     return;
   }
-  if (!input.fly || state.onGround || !state.shortFlyAvailable) {
+  if (!input.fly || previous.onGround || !previous.shortFlyAvailable) {
     return;
   }
 
-  state.vy = Math.min(state.vy, JUMP_VY * 0.6);
-  state.shortFlyAvailable = false;
+  next.vy = Math.min(next.vy, JUMP_VY * 0.6);
+  next.shortFlyAvailable = false;
 }
 
-function applyJetpack(state: PlayerState, abilities: LevelT['rules']['abilities'], input: InputState): void {
-  if (!abilities.jetpack) {
+function applyJetpack(previous: PlayerState, next: PlayerState, context: StepContext, input: InputState): void {
+  if (!context.abilities.jetpack) {
     return;
   }
-  if (!input.thrust || state.jetpackFuel <= 0) {
+  if (!input.thrust || previous.jetpackFuel <= 0) {
     return;
   }
 
-  const thrust = abilities.jetpack.thrust;
-  state.vy += thrust * DT;
-  state.jetpackFuel = clamp(state.jetpackFuel - 1, 0, abilities.jetpack.fuel);
+  next.vy += context.abilities.jetpack.thrust * DT;
+  next.jetpackFuel = Math.max(0, previous.jetpackFuel - 1);
 }
 
-export function step(level: LevelT, previousState: PlayerState, rawInput: InputCmd | InputState): StepResult {
-  const abilities = level.rules.abilities;
-  const tiles = level.tiles.filter((tile) => tile.type === 'ground' || tile.type === 'platform');
-  const hazards = level.tiles.filter((tile) => tile.type === 'hazard');
+export function step(level: LevelT, state: PlayerState, input: InputState, context?: StepContext): StepResult {
+  const ctx = context ?? createStepContext(level);
+  const previous = cloneState(state);
+  const next = cloneState(state);
+  next.frame = state.frame + 1;
 
-  const input = 'left' in rawInput ? (rawInput as InputState) : normaliseInput(rawInput as InputCmd);
-  const next: PlayerState = {
-    ...previousState,
-    frame: previousState.frame + 1,
-    x: previousState.x,
-    y: previousState.y,
-    vx: 0,
-    vy: previousState.vy,
-    onGround: previousState.onGround,
-    coyoteTimerMs: previousState.coyoteTimerMs,
-    jumpBufferMs: previousState.jumpBufferMs,
-    shortFlyAvailable: previousState.shortFlyAvailable,
-    jetpackFuel: previousState.jetpackFuel,
-  };
+  const wantsLeft = input.left && !input.right;
+  const wantsRight = input.right && !input.left;
+  if (wantsLeft === wantsRight) {
+    next.vx = 0;
+  } else {
+    next.vx = wantsLeft ? -MOVE_SPEED : MOVE_SPEED;
+  }
 
-  next.vx = input.left === input.right ? 0 : input.left ? -MOVE_SPEED : MOVE_SPEED;
-
-  if (next.onGround) {
+  if (previous.onGround) {
     next.coyoteTimerMs = COYOTE_MS;
     next.shortFlyAvailable = true;
   } else {
-    next.coyoteTimerMs = Math.max(0, next.coyoteTimerMs - DT * 1000);
+    next.coyoteTimerMs = Math.max(0, previous.coyoteTimerMs - DT * 1000);
+    next.shortFlyAvailable = previous.shortFlyAvailable;
   }
 
   if (input.jump) {
     next.jumpBufferMs = JUMPBUFFER_MS;
   } else {
-    next.jumpBufferMs = Math.max(0, next.jumpBufferMs - DT * 1000);
+    next.jumpBufferMs = Math.max(0, previous.jumpBufferMs - DT * 1000);
   }
 
-  applyJump(next, abilities);
-  applyShortFly(next, abilities, input);
-  applyJetpack(next, abilities, input);
+  next.jetpackFuel = previous.jetpackFuel;
+  next.onGround = previous.onGround;
+  next.vy = previous.vy;
+
+  if (next.jumpBufferMs > 0 && (previous.onGround || previous.coyoteTimerMs > 0)) {
+    applyJump(previous, next, ctx);
+  }
+
+  applyShortFly(previous, next, ctx, input);
+  applyJetpack(previous, next, ctx, input);
 
   next.vy += GRAVITY_Y * DT;
 
-  resolveHorizontalCollisions(next, tiles);
-  resolveVerticalCollisions(next, tiles);
+  const nextX = previous.x + next.vx * DT;
+  const vertical = resolveVerticalMovement(previous, next, ctx, nextX);
+  next.x = nextX;
+  next.y = vertical.y;
+  next.onGround = vertical.onGround;
+
+  if (!next.onGround && next.coyoteTimerMs > 0) {
+    next.coyoteTimerMs = Math.max(0, next.coyoteTimerMs - DT * 1000);
+  }
+
+  if (next.onGround) {
+    next.shortFlyAvailable = true;
+  }
+
+  next.furthestX = Math.max(previous.furthestX, next.x);
 
   const playerRect: Rect = { x: next.x, y: next.y, w: PLAYER_WIDTH, h: PLAYER_HEIGHT };
-  const collidedHazard = hazards.some((hazard) => rectsOverlap(playerRect, hazard));
+  const collidedHazard = ctx.hazards.some((hazard) => rectsOverlap(playerRect, hazard));
 
-  return {
-    ...next,
-    collidedHazard,
-    terminated: false,
-  };
+  return { state: next, collidedHazard };
+}
+
+function buildExitRect(level: LevelT): Rect {
+  return { x: level.exit.x - PLAYER_WIDTH, y: level.exit.y - PLAYER_HEIGHT, w: PLAYER_WIDTH * 2, h: PLAYER_HEIGHT * 2 };
+}
+
+function compressExecuted(commands: InputCmd[]): InputCmd[] {
+  const result: InputCmd[] = [];
+  const sorted = mergeCommands(commands);
+  let prevState = defaultInput();
+
+  for (const command of sorted) {
+    const nextState = applyCommand(prevState, command);
+    const delta: InputCmd = { t: command.t };
+    let changed = false;
+
+    (['left', 'right', 'jump', 'fly', 'thrust'] as const).forEach((key) => {
+      if (prevState[key] !== nextState[key]) {
+        delta[key] = nextState[key];
+        changed = true;
+      }
+    });
+
+    if (changed || command.t === 0) {
+      result.push(delta);
+    }
+    prevState = nextState;
+  }
+
+  return result;
 }
 
 export function simulate(level: LevelT, inputs: InputCmd[]): SimResult {
   const baseState = initialPlayerState(level);
   if (!baseState) {
-    return { ok: false, reason: 'no_spawn', frames: 0, x: 0, y: 0, visited: new Set() };
+    return { ok: false, reason: 'no_spawn', frames: 0, path: [] };
   }
 
-  const visited: GridHash = new Set();
-  const sortedInputs = [...inputs].sort((a, b) => a.t - b.t);
-  let currentInput: InputState = normaliseInput(sortedInputs[0]);
-  if (sortedInputs.length === 0) {
-    currentInput = normaliseInput();
-  }
-  let nextCmdIndex = 1;
+  const commands = mergeCommands(inputs);
+  const applied: InputCmd[] = [];
+  const context = createStepContext(level);
+  const exitRect = buildExitRect(level);
 
-  let state: PlayerState = { ...baseState };
-  let frame = 0;
+  let state = cloneState(baseState);
+  let inputState = defaultInput();
+  let commandIndex = 0;
+  let nextCommand = commands[commandIndex];
+  const maxFrames = Math.max(3600, Math.floor((level.rules.duration_target_s ?? 60) * TICK_HZ * 2));
 
-  const maxFrame = (sortedInputs.at(-1)?.t ?? 0) * 2 + 600;
-
-  const hazards = level.tiles.filter((tile) => tile.type === 'hazard');
-  const exitRect: Rect = { x: level.exit.x - 16, y: level.exit.y - 48, w: 32, h: 48 };
-
-  while (frame < maxFrame) {
-    const inputFrame = Math.floor(frame / 2);
-    if (nextCmdIndex < sortedInputs.length && sortedInputs[nextCmdIndex].t <= inputFrame) {
-      currentInput = normaliseInput(sortedInputs[nextCmdIndex]);
-      nextCmdIndex += 1;
+  for (let frame = 0; frame < maxFrames; frame += 1) {
+    if (frame % INPUT_FRAME_INTERVAL === 0) {
+      const inputFrame = frame / INPUT_FRAME_INTERVAL;
+      while (nextCommand && nextCommand.t <= inputFrame) {
+        inputState = applyCommand(inputState, nextCommand);
+        applied.push({ ...nextCommand });
+        commandIndex += 1;
+        nextCommand = commands[commandIndex];
+      }
     }
 
-    const result = step(level, state, currentInput);
-    state = result;
-
-    const key = `${Math.floor(state.frame / 2)}:${quantisePosition(state.x)}:${quantisePosition(state.y)}`;
-    visited.add(key);
+    const { state: nextState, collidedHazard } = step(level, state, inputState, context);
+    state = nextState;
 
     const playerRect: Rect = { x: state.x, y: state.y, w: PLAYER_WIDTH, h: PLAYER_HEIGHT };
     if (rectsOverlap(playerRect, exitRect)) {
-      return { ok: true, frames: state.frame, x: state.x, y: state.y, visited };
+      return { ok: true, frames: state.frame, path: compressExecuted(applied) };
     }
 
-    if (result.collidedHazard || hazards.some((hazard) => rectsOverlap(playerRect, hazard))) {
-      return { ok: false, reason: 'hazard', frames: state.frame, x: state.x, y: state.y, visited };
+    if (collidedHazard) {
+      return { ok: false, frames: state.frame, reason: 'hazard', path: compressExecuted(applied) };
     }
-
-    frame += 1;
   }
 
-  return { ok: false, reason: 'timeout', frames: state.frame, x: state.x, y: state.y, visited };
+  return { ok: false, frames: state.frame, reason: 'timeout', path: compressExecuted(applied) };
 }
 
 export function maxJumpGapPX(highJump = false): number {

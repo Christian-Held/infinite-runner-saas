@@ -1,8 +1,18 @@
+import 'dotenv/config';
+
 import { startWorkers } from './queue';
 
 async function bootstrap() {
   const runtime = await startWorkers();
   console.log('[playtester] Workers for gen/test queues started');
+
+  if (!process.env.OPENAI_API_KEY) {
+    console.error('[playtester] OPENAI_API_KEY is not set. Please configure services/playtester/.env and restart.');
+    await runtime
+      .close()
+      .catch((error) => console.error('[playtester] Failed to close runtime after missing API key', error));
+    process.exit(1);
+  }
 
   let shuttingDown = false;
   const shutdown = async (signal: NodeJS.Signals) => {
