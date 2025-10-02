@@ -5,6 +5,7 @@ import type IORedis from 'ioredis';
 import pino from 'pino';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
+import { createRequire } from 'node:module';
 
 import { Ability, Level, getLevelPlan } from '@ir/game-spec';
 
@@ -27,6 +28,11 @@ import {
   getSeasonStatus,
 } from './db';
 import type { QueueManager } from './queue';
+import { httpRequestDurationSeconds, httpRequestsTotal, registry } from './metrics';
+
+const require = createRequire(import.meta.url);
+const { version: packageVersion } = require('../package.json') as { version?: string };
+const apiVersion = typeof packageVersion === 'string' ? packageVersion : '0.0.0';
 
 interface BuildServerOptions {
   db: Database.Database;
@@ -34,7 +40,10 @@ interface BuildServerOptions {
   queueManager: QueueManager;
 }
 
-const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN ?? 'dev-internal';
+const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN;
+if (!INTERNAL_TOKEN) {
+  throw new Error('INTERNAL_TOKEN must be set');
+}
 
 function requireInternalToken(request: FastifyRequest): void {
   const token = request.headers['x-internal-token'];
@@ -137,8 +146,73 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
   const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
   const server = Fastify({ logger });
 
+  const allowedOrigins = (process.env.ORIGIN_ALLOW ?? '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0);
+
   server.register(cors, {
-    origin: 'http://localhost:5173',
+    origin: (origin, callback) => {
+      if (!origin) {
+        callback(null, true);
+        return;
+      }
+      if (allowedOrigins.length === 0) {
+        callback(null, false);
+        return;
+      }
+      callback(null, allowedOrigins.includes(origin));
+    },
+  });
+
+  const RATE_WINDOW_MS = Number.parseInt(process.env.RATE_WINDOW_MS ?? '60000', 10);
+  const RATE_MAX = Number.parseInt(process.env.RATE_MAX ?? '30', 10);
+  const RATE_MAX_SEASON = Number.parseInt(process.env.RATE_MAX_SEASON ?? '2', 10);
+  const RATE_WINDOW_SEASON_MS = Number.parseInt(process.env.RATE_WINDOW_SEASON_MS ?? '600000', 10);
+
+  const rateLogger = server.log.child({ module: 'rate-limit' });
+
+  const ensurePositiveWindow = (windowMs: number) => (Number.isFinite(windowMs) && windowMs > 0 ? windowMs : 60000);
+
+  async function checkRateLimit(
+    key: string,
+    ip: string,
+    max: number,
+    windowMs: number,
+  ): Promise<boolean> {
+    if (!Number.isFinite(max) || max <= 0) {
+      return true;
+    }
+    const safeWindow = ensurePositiveWindow(windowMs);
+    const windowId = Math.floor(Date.now() / safeWindow);
+    const redisKey = `rate:${key}:${windowId}:${ip}`;
+    try {
+      const count = await redis.incr(redisKey);
+      if (count === 1) {
+        await redis.pexpire(redisKey, safeWindow);
+      }
+      return count <= max;
+    } catch (error) {
+      rateLogger.warn({ err: error }, 'rate limit check failed');
+      return true;
+    }
+  }
+
+  server.addHook('onRequest', (request, _reply, done) => {
+    (request as FastifyRequest & { metricsStart?: bigint }).metricsStart = process.hrtime.bigint();
+    done();
+  });
+
+  server.addHook('onResponse', (request, reply, done) => {
+    const metricsStart = (request as FastifyRequest & { metricsStart?: bigint }).metricsStart;
+    const route = request.routeOptions?.url ?? request.routerPath ?? request.url;
+    const status = String(reply.statusCode);
+    httpRequestsTotal.labels(request.method, route, status).inc();
+    if (metricsStart) {
+      const durationSeconds = Number(process.hrtime.bigint() - metricsStart) / 1_000_000_000;
+      httpRequestDurationSeconds.labels(request.method, route, status).observe(durationSeconds);
+    }
+    done();
   });
 
   const getRedisOk = async (): Promise<boolean> => {
@@ -157,40 +231,85 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
 
   server.get('/health', async () => {
     const redisOk = await getRedisOk();
+    const dbOk = pingDb(db);
+    const [queues, budget] = await Promise.all([
+      queueManager.getQueueOverview(),
+      queueManager.getBudgetStatus(),
+    ]);
 
     return {
-      status: 'ok',
-      db: pingDb(db),
+      status: redisOk && dbOk && budget.ok ? 'ok' : 'degraded',
+      db: dbOk,
       redis: redisOk,
+      version: apiVersion,
+      uptime_s: Math.round(process.uptime()),
+      queue: queues,
+      budget,
     };
   });
 
+  server.get('/metrics', async (_request, reply) => {
+    const metrics = await registry.metrics();
+    reply.header('content-type', registry.contentType);
+    return metrics;
+  });
+
   server.post('/levels/generate', async (request, reply) => {
+    const allowed = await checkRateLimit('levels:generate', request.ip, RATE_MAX, RATE_WINDOW_MS);
+    if (!allowed) {
+      reply.status(429).send({ error: 'rate_limited' });
+      return;
+    }
     const body = GenerateBody.parse(request.body ?? {});
-    const jobId = await queueManager.enqueueGen({
-      seed: body.seed,
-      difficulty: body.difficulty,
-      abilities: body.abilities,
-    });
-    reply.status(202).send({ job_id: jobId });
+    try {
+      const jobId = await queueManager.enqueueGen({
+        seed: body.seed,
+        difficulty: body.difficulty,
+        abilities: body.abilities,
+      });
+      reply.status(202).send({ job_id: jobId });
+    } catch (error) {
+      if (error instanceof Error && error.message === 'budget_exceeded') {
+        reply.status(503).send({ error: 'budget_exceeded' });
+        return;
+      }
+      throw error;
+    }
   });
 
   server.post('/seasons/build', async (request, reply) => {
+    const allowed = await checkRateLimit(
+      'seasons:build',
+      request.ip,
+      RATE_MAX_SEASON,
+      RATE_WINDOW_SEASON_MS,
+    );
+    if (!allowed) {
+      reply.status(429).send({ error: 'rate_limited' });
+      return;
+    }
     const body = SeasonBuildBody.parse(request.body ?? {});
     const from = body.from ?? 1;
     const to = body.to ?? 100;
     let count = 0;
-
-    for (let levelNumber = from; levelNumber <= to; levelNumber += 1) {
-      const plan = getLevelPlan(levelNumber);
-      await queueManager.enqueueGen({
-        seed: undefined,
-        difficulty: plan.difficultyTarget,
-        abilities: plan.abilities,
-        seasonId: body.seasonId,
-        levelNumber,
-      });
-      count += 1;
+    try {
+      for (let levelNumber = from; levelNumber <= to; levelNumber += 1) {
+        const plan = getLevelPlan(levelNumber);
+        await queueManager.enqueueGen({
+          seed: undefined,
+          difficulty: plan.difficultyTarget,
+          abilities: plan.abilities,
+          seasonId: body.seasonId,
+          levelNumber,
+        });
+        count += 1;
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message === 'budget_exceeded') {
+        reply.status(503).send({ error: 'budget_exceeded', count });
+        return;
+      }
+      throw error;
     }
 
     reply.status(202).send({ seasonId: body.seasonId, count });
