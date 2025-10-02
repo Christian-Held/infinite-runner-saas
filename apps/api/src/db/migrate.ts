@@ -34,6 +34,16 @@ export async function migrate(db: Database.Database): Promise<void> {
     );
   `);
 
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS level_paths (
+      level_id TEXT PRIMARY KEY,
+      path_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY(level_id) REFERENCES levels(id)
+    );
+  `);
+
   db.exec(`CREATE INDEX IF NOT EXISTS idx_levels_published ON levels(published);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);`);
 

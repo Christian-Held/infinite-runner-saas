@@ -4,6 +4,7 @@ import process from 'node:process';
 
 import { openDb } from './db';
 import { migrate } from './db/migrate';
+import { createQueueManager } from './queue';
 import { buildServer } from './server';
 
 dotenv.config();
@@ -26,7 +27,8 @@ async function bootstrap() {
     }
   };
   redis.on('error', onRedisError);
-  const server = buildServer({ db, redis });
+  const queueManager = await createQueueManager();
+  const server = buildServer({ db, redis, queueManager });
 
   let shuttingDown = false;
 
@@ -42,6 +44,12 @@ async function bootstrap() {
       console.log('server closed');
     } catch (error) {
       console.error('Error while closing server:', error);
+    }
+
+    try {
+      await queueManager.close();
+    } catch (error) {
+      console.error('Error while closing queue manager:', error);
     }
 
     try {
@@ -75,6 +83,12 @@ async function bootstrap() {
     await server.listen({ host, port });
   } catch (error) {
     console.error('Failed to start HTTP server:', error);
+    try {
+      await queueManager.close();
+    } catch (queueError) {
+      console.error('Error while closing queue manager after listen failure:', queueError);
+    }
+
     try {
       redis.off('error', onRedisError);
       redis.disconnect();

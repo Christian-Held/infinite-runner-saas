@@ -6,8 +6,8 @@ import IORedis from 'ioredis';
 import { z } from 'zod';
 
 import { DEFAULT_CONSTRAINTS, closeGenerator, generateLevel } from './generator';
-import { fetchLevel, ingestLevel, createJobRecord, updateJobStatus } from './internal-client';
-import { runHeuristicChecks } from './tester';
+import { fetchLevel, ingestLevel, createJobRecord, updateJobStatus, submitLevelPath } from './internal-client';
+import { testLevel } from './tester';
 
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
 
@@ -93,15 +93,24 @@ export async function startWorkers(): Promise<WorkerRuntime> {
         await updateJobStatus({ id: jobId, status: 'running' });
 
         const level = await fetchLevel(job.data.levelId);
-        const result = runHeuristicChecks(level, DEFAULT_CONSTRAINTS);
-        if (!result.success) {
-          throw new Error(result.reason ?? 'Level failed heuristics');
+        const result = await testLevel(level);
+        if (!result.ok || !result.path) {
+          const reason = result.reason ?? 'no_path';
+          throw new Error(reason);
         }
 
+        await submitLevelPath({ levelId: job.data.levelId, path: result.path });
         await updateJobStatus({ id: jobId, status: 'succeeded', levelId: job.data.levelId });
+        console.log('[testWorker] search done', {
+          jobId,
+          nodes: result.nodes ?? 0,
+          visited: result.visited ?? 0,
+          durationMs: result.durationMs ?? 0,
+          result: 'ok',
+        });
       } catch (error) {
         const message = toErrorMessage(error);
-        await updateJobStatus({ id: jobId, status: 'failed', error: message });
+        await updateJobStatus({ id: jobId, status: 'failed', error: message, levelId: job.data.levelId });
         throw error;
       }
     },

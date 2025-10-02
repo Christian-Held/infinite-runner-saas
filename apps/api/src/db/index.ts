@@ -50,6 +50,13 @@ interface JobRow {
   updated_at: number;
 }
 
+interface LevelPathRow {
+  level_id: string;
+  path_json: string;
+  created_at: number;
+  updated_at: number;
+}
+
 const DEFAULT_DB_PATH = './data/app.db';
 
 let dbInstance: Database.Database | null = null;
@@ -233,6 +240,32 @@ export function getJob(id: string): JobRecord | null {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+export function upsertLevelPath(levelId: string, path: unknown): void {
+  const db = getDb();
+  const now = Date.now();
+  const payload = JSON.stringify(path ?? []);
+  const stmt = db.prepare(`
+    INSERT INTO level_paths (level_id, path_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(level_id) DO UPDATE SET path_json = excluded.path_json, updated_at = excluded.updated_at
+  `);
+  stmt.run(levelId, payload, now, now);
+}
+
+export function getLevelPath(levelId: string): unknown | null {
+  const db = getDb();
+  const row = db.prepare('SELECT * FROM level_paths WHERE level_id = ?').get(levelId) as LevelPathRow | undefined;
+  if (!row) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(row.path_json);
+  } catch (error) {
+    return null;
+  }
 }
 
 export function pingDb(database: Database.Database = getDb()): boolean {
