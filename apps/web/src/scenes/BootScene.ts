@@ -25,22 +25,6 @@ export class BootScene extends Phaser.Scene {
       graphics.destroy();
     });
 
-    const message = this.add
-      .text(this.scale.width / 2, this.scale.height / 2, 'Season-1 starten\n<SPACE> drücken', {
-        fontSize: '32px',
-        fontFamily: 'system-ui, sans-serif',
-        color: '#f8fafc',
-        align: 'center',
-      })
-      .setOrigin(0.5);
-
-    const startSeason = () => {
-      message.destroy();
-      this.scene.start('game');
-    };
-
-    this.input.keyboard.once('keydown-SPACE', startSeason);
-    this.input.keyboard.once('keydown-ENTER', startSeason);
-    this.input.once('pointerdown', startSeason);
+    this.scene.start('start');
   }
 }
