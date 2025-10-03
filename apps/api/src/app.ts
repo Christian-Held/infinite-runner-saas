@@ -19,7 +19,7 @@ async function bootstrap() {
   const config = loadConfig();
   requireProdSecrets(config);
 
-  const db = openDb();
+  const db = openDb(config.databasePath);
   await migrate(db);
 
   const redis = new IORedis(config.redisUrl);
@@ -34,7 +34,12 @@ async function bootstrap() {
   };
   redis.on('error', onRedisError);
 
-  const queueManager = await createQueueManager();
+  const queueManager = await createQueueManager({
+    redisUrl: config.redisUrl,
+    queuePrefix: config.queue.prefix,
+    budgetUsdPerDay: config.queue.budgetUsdPerDay,
+    logger,
+  });
   const internalToken = config.internalToken ?? 'dev-internal';
   const server = buildServer({
     db,

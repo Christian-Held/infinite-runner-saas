@@ -80,6 +80,7 @@ export class GameScene extends Phaser.Scene {
   private approvedLevels: LevelSummary[] = [];
   private preloadedLevels = new Map<string, LevelT>();
   private pendingNextLevel: LevelTarget | null = null;
+  private completed = false;
 
   private player!: DynamicSprite;
   private platforms!: Phaser.Physics.Arcade.StaticGroup;
@@ -176,6 +177,7 @@ export class GameScene extends Phaser.Scene {
 
   private async initializeLevel(): Promise<void> {
     this.isLevelReady = false;
+    this.completed = false;
     this.showLoadingState(true);
     this.disposeLevelObjects();
 
@@ -653,7 +655,7 @@ export class GameScene extends Phaser.Scene {
   }
 
   private restartLevel(): void {
-    if (!this.scene.isActive()) {
+    if (this.completed || !this.scene.isActive()) {
       return;
     }
 
@@ -667,9 +669,18 @@ export class GameScene extends Phaser.Scene {
   }
 
   private completeLevel(): void {
+    if (this.completed) {
+      return;
+    }
+    this.completed = true;
+
     const elapsed = this.getElapsedSeconds(this.time.now);
     console.info(`Level geschafft in ${elapsed.toFixed(2)}s`);
     this.isLevelReady = false;
+    if (this.hazardOverlap) {
+      this.hazardOverlap.destroy();
+      this.hazardOverlap = null;
+    }
 
     const next = this.pendingNextLevel;
     if (next) {

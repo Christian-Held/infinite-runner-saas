@@ -92,7 +92,13 @@ TUNE_MAX_ROUNDS=3
 | Playtester | `pnpm --filter @srv/playtester dev` | 9100 (metrics) | Worker logs in `.logs/playtester-*.log`. |
 | Redis (Docker) | `docker compose up redis -d` | 6379 | Data stored in Docker volume `infinite-runner-saas_redis-data`. |
 
-Log files (if enabled) live under `.logs/*.log`. Rotate daily per service. Use `Get-Content .\.logs\api-$(Get-Date -Format 'yyyy-MM-dd').log -Wait` to tail in PowerShell.
+## Logging
+
+* API logs rotate daily at `.logs/api-YYYY-MM-DD.log` and the playtester rotates under `.logs/playtester-YYYY-MM-DD.log`.
+* Tail logs in PowerShell with `Get-Content .\.logs\api-$(Get-Date -Format 'yyyy-MM-dd').log -Wait` (replace `api` with `playtester` as needed).
+* On startup the API and workers log their BullMQ queue names and prefix—use those messages to diagnose queue routing issues.
+* When `OPENAI_API_KEY` is missing the playtester logs an error before processing jobs; add the key and restart the worker.
+* Do not record secrets in log files; redact tokens before sharing snippets.
 
 ## Reset & Recovery Recipes
 
@@ -109,22 +115,20 @@ Log files (if enabled) live under `.logs/*.log`. Rotate daily per service. Use `
 | --- | --- | --- |
 | API unreachable (`ECONNREFUSED`) | API not running or port blocked. | Restart API terminal, ensure port 3000 free, re-run health check. |
 | Queue stuck in `queued` | Redis unreachable or workers down. | Verify Redis container (`docker ps`), restart playtester service. |
-| `OPENAI_API_KEY` missing warning | Playtester started without key. | Add key to `services/playtester/.env`, restart worker. |
+| `OPENAI_API_KEY` missing warning | Playtester started without key; startup logs show the error. | Add key to `services/playtester/.env`, restart worker. |
+| Jobs queued but never processed despite workers running | Queue prefix mismatch between API and workers. | Compare queue prefix in API and worker startup logs; align `QUEUE_PREFIX` and restart both. |
 | Redis URL mismatch between services | Different `REDIS_URL` envs. | Align `.env` values and restart API + workers. |
-| HTTP 401 on `/internal/*` | Wrong `x-internal-token`. | Confirm token from `.env` matches request header. |
+| HTTP 401 on `/internal/*` | Wrong `x-internal-token`. | Confirm token from `.env` matches request header; check API startup log for the expected token name. |
 
 ## Testing & Coverage
 
-* Run every workspace test: `pnpm -r test` (falls back to each package's `test` script when defined).
-* API unit tests (Vitest):
-  ```powershell
-  pnpm --filter api exec vitest run
-  pnpm --filter api exec vitest run --coverage
-  ```
-* Playtester tests (Vitest, individual):
-  ```powershell
-  pnpm --filter @srv/playtester exec vitest run
-  ```
+* Run the entire monorepo suite with coverage: `pnpm -r test` (uses `vitest.workspace.ts`).
+* Run a single workspace with coverage targets:
+  * API: `pnpm --filter api exec vitest run --coverage`
+  * Playtester: `pnpm --filter @srv/playtester exec vitest run --coverage`
+  * Web: `pnpm --filter web exec vitest run --coverage`
+  * Game spec: `pnpm --filter @ir/game-spec exec vitest run --coverage`
+* Each suite enforces ≥90% line and branch coverage—review the Vitest summary before merging.
 
 ## Repository Map
 

@@ -21,6 +21,7 @@ import {
   insertLevel,
   insertLevelRevision,
   listLevelRevisions,
+  listLevels,
   listSeasonLevels,
   pingDb,
   updateLevel,
@@ -48,14 +49,19 @@ interface BuildServerOptions {
 }
 
 function createInternalTokenHook(expectedToken: string) {
-  return (request: FastifyRequest, reply: FastifyReply) => {
+  return async (request: FastifyRequest, reply: FastifyReply) => {
+    const routeUrl = request.routeOptions?.url ?? request.routerPath;
+    if (!routeUrl || !routeUrl.startsWith('/internal/')) {
+      return;
+    }
     const token = request.headers['x-internal-token'];
     const provided = Array.isArray(token) ? token[0] : token;
     if (provided !== expectedToken) {
       request.log.warn({ reqId: request.id }, 'Invalid internal token');
       reply.status(401).send({ error: 'unauthorized' });
-      return;
+      return reply;
     }
+    return;
   };
 }
 
@@ -152,6 +158,12 @@ const SeasonBuildBody = z
     path: ['to'],
   });
 
+const ListLevelsQuery = z.object({
+  published: z.enum(['true', 'false']).optional(),
+  limit: z.string().optional(),
+  offset: z.string().optional(),
+});
+
 const SeasonLevelsQuery = z.object({
   published: z.enum(['true', 'false']).optional(),
 });
@@ -175,7 +187,8 @@ export function buildServer({
     },
   });
 
-  const requireInternalToken = createInternalTokenHook(internalToken);
+  const enforceInternalToken = createInternalTokenHook(internalToken);
+  server.addHook('preHandler', enforceInternalToken);
 
   const allowedOrigins = config.originAllowList;
 
@@ -368,6 +381,26 @@ export function buildServer({
     reply.status(202).send({ seasonId: body.seasonId, count });
   });
 
+  server.get('/levels', async (request, reply) => {
+    const query = ListLevelsQuery.parse(extractQuery(request));
+    const published = typeof query.published === 'string' ? query.published === 'true' : undefined;
+
+    const limitCandidate = query.limit ? Number.parseInt(query.limit, 10) : Number.NaN;
+    const offsetCandidate = query.offset ? Number.parseInt(query.offset, 10) : Number.NaN;
+    const limit = Number.isFinite(limitCandidate) && limitCandidate > 0 ? Math.min(limitCandidate, 100) : undefined;
+    const offset = Number.isFinite(offsetCandidate) && offsetCandidate >= 0 ? offsetCandidate : undefined;
+
+    const records = listLevels({ published, limit, offset });
+    const levels = records.map((entry) => ({
+      ...entry.level,
+      published: entry.published,
+      created_at: entry.createdAt,
+      updated_at: entry.updatedAt,
+    }));
+
+    reply.send({ levels });
+  });
+
   server.get('/levels/:id', async (request, reply) => {
     const params = extractParams(request);
     const id = z.string().parse(params.id);
@@ -457,13 +490,13 @@ export function buildServer({
     reply.send({ seasonId, levels });
   });
 
-  server.post('/internal/levels', { preHandler: requireInternalToken }, async (request, reply) => {
+  server.post('/internal/levels', async (request, reply) => {
     const body = IngestBody.parse(request.body ?? {});
     insertLevel(body.level, { difficulty: body.meta.difficulty, seed: body.meta.seed });
     reply.status(201).send({ id: body.level.id });
   });
 
-  server.post('/internal/levels/meta', { preHandler: requireInternalToken }, async (request, reply) => {
+  server.post('/internal/levels/meta', async (request, reply) => {
     const body = LevelMetaBody.parse(request.body ?? {});
     const level = getLevel(body.level_id);
     if (!level) {
@@ -475,7 +508,7 @@ export function buildServer({
     reply.status(204).send();
   });
 
-  server.post('/internal/jobs', { preHandler: requireInternalToken }, async (request, reply) => {
+  server.post('/internal/jobs', async (request, reply) => {
     const body = InternalJobBody.parse(request.body ?? {});
     insertJob({
       id: body.id,
@@ -486,7 +519,7 @@ export function buildServer({
     reply.status(204).send();
   });
 
-  server.post('/internal/jobs/:id/status', { preHandler: requireInternalToken }, async (request, reply) => {
+  server.post('/internal/jobs/:id/status', async (request, reply) => {
     const params = extractParams(request);
     const id = z.string().parse(params.id);
     const body = UpdateJobBody.parse(request.body ?? {});
@@ -499,7 +532,7 @@ export function buildServer({
     reply.status(204).send();
   });
 
-  server.post('/internal/levels/path', { preHandler: requireInternalToken }, async (request, reply) => {
+  server.post('/internal/levels/path', async (request, reply) => {
     const body = InternalPathBody.parse(request.body ?? {});
     const level = getLevel(body.level_id);
     if (!level) {
@@ -511,7 +544,7 @@ export function buildServer({
     reply.status(204).send();
   });
 
-  server.post('/internal/levels/metrics', { preHandler: requireInternalToken }, async (request, reply) => {
+  server.post('/internal/levels/metrics', async (request, reply) => {
     const body = LevelMetricsBody.parse(request.body ?? {});
     const level = getLevel(body.level_id);
     if (!level) {
@@ -523,7 +556,7 @@ export function buildServer({
     reply.status(204).send();
   });
 
-  server.post('/internal/season-jobs/status', { preHandler: requireInternalToken }, async (request, reply) => {
+  server.post('/internal/season-jobs/status', async (request, reply) => {
     const body = SeasonJobStatusBody.parse(request.body ?? {});
     updateSeasonJob({
       seasonId: body.season_id,
@@ -535,7 +568,7 @@ export function buildServer({
     reply.status(204).send();
   });
 
-  server.post('/internal/levels/patch', { preHandler: requireInternalToken }, async (request, reply) => {
+  server.post('/internal/levels/patch', async (request, reply) => {
     const body = LevelPatchBody.parse(request.body ?? {});
     const existing = getLevel(body.level_id);
     if (!existing) {

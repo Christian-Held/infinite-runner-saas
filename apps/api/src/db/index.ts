@@ -155,14 +155,15 @@ function ensureDirectoryFor(filePath: string) {
   }
 }
 
-export function openDb(): Database.Database {
+export function openDb(dbPath: string = DEFAULT_DB_PATH): Database.Database {
   if (dbInstance) {
     return dbInstance;
   }
 
-  const dbPath = process.env.DB_PATH ?? DEFAULT_DB_PATH;
-  const resolvedPath = resolveDbPath(dbPath);
-  ensureDirectoryFor(resolvedPath);
+  const resolvedPath = dbPath === ':memory:' ? ':memory:' : resolveDbPath(dbPath);
+  if (resolvedPath !== ':memory:') {
+    ensureDirectoryFor(resolvedPath);
+  }
 
   try {
     dbInstance = new Database(resolvedPath);
