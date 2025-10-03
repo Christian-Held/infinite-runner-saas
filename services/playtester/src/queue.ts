@@ -5,6 +5,8 @@ import { Queue, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { z } from 'zod';
 
+import type { Logger } from '@ir/logger';
+
 import { closeGenerator, generateLevel } from './generator';
 import {
   fetchLevel,
@@ -52,8 +54,13 @@ function toErrorMessage(error: unknown): string {
   return typeof error === 'string' ? error : JSON.stringify(error);
 }
 
-export async function startWorkers(): Promise<WorkerRuntime> {
+export async function startWorkers(logger: Logger): Promise<WorkerRuntime> {
   const connection = new IORedis(REDIS_URL);
+  const queueLogger = logger.child({ module: 'workers', redisUrl: REDIS_URL });
+
+  connection.on('error', (error) => {
+    queueLogger.error({ err: error }, 'Redis connection error');
+  });
 
   const genQueue = new Queue<GenJobData>('gen', {
     connection,
@@ -64,11 +71,24 @@ export async function startWorkers(): Promise<WorkerRuntime> {
     defaultJobOptions: { removeOnComplete: true },
   });
 
+  queueLogger.info(
+    {
+      queues: ['gen', 'test'],
+      prefix: genQueue.opts.prefix ?? 'bull',
+    },
+    'Starting playtester workers',
+  );
+
+  const genWorkerLogger = queueLogger.child({ worker: 'gen' });
+  const testWorkerLogger = queueLogger.child({ worker: 'test' });
+
   const genWorker = new Worker<GenJobData>(
     'gen',
     async (job) => {
       const jobId = job.id ?? randomUUID();
+      const jobLogger = genWorkerLogger.child({ jobId });
       const startedAt = process.hrtime.bigint();
+      jobLogger.info({ data: job.data }, 'Generation job started');
       try {
         await updateJobStatus({ id: jobId, status: 'running' });
 
@@ -90,6 +110,7 @@ export async function startWorkers(): Promise<WorkerRuntime> {
           seed,
           difficulty,
           abilities,
+          jobLogger,
           job.data.levelNumber,
           job.data.seasonId,
         );
@@ -127,10 +148,16 @@ export async function startWorkers(): Promise<WorkerRuntime> {
             error: message,
             levelId: level.id,
           });
+          jobLogger.error({ err: error }, 'Failed to enqueue test job');
           throw error;
         }
+
+        const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+        jobLogger.info({ durationMs, levelId: level.id }, 'Generation job succeeded');
         recordQueueJob('gen', 'succeeded', startedAt);
       } catch (error) {
+        const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+        jobLogger.error({ err: error, durationMs }, 'Generation job failed');
         const message = toErrorMessage(error);
         await updateJobStatus({ id: jobId, status: 'failed', error: message });
         if (job.data.seasonId && typeof job.data.levelNumber === 'number') {
@@ -155,7 +182,9 @@ export async function startWorkers(): Promise<WorkerRuntime> {
     'test',
     async (job) => {
       const jobId = job.id ?? randomUUID();
+      const jobLogger = testWorkerLogger.child({ jobId });
       const startedAt = process.hrtime.bigint();
+      jobLogger.info({ data: job.data }, 'Test job started');
       let failedAttempts = 0;
       let lastReason: string | undefined;
       try {
@@ -171,7 +200,7 @@ export async function startWorkers(): Promise<WorkerRuntime> {
           Number.isFinite(MAX_TUNE_ROUNDS) && MAX_TUNE_ROUNDS > 0 ? MAX_TUNE_ROUNDS : 3;
 
         for (let round = 0; round < maxRounds; round += 1) {
-          const result = await testLevel(level);
+          const result = await testLevel(level, jobLogger);
           if (result.ok && result.path) {
             await submitLevelPath({ levelId: job.data.levelId, path: result.path });
             const finalScore = scoreLevel(level);
@@ -191,9 +220,13 @@ export async function startWorkers(): Promise<WorkerRuntime> {
                 jobId,
               });
             }
-            console.log(
-              `[testWorker] attempt=${round + 1} nodes=${result.nodes ?? 0} time=${result.durationMs ?? 0}ms result=ok`,
-            );
+            jobLogger.info({
+              attempt: round + 1,
+              nodes: result.nodes ?? 0,
+              durationMs: result.durationMs ?? 0,
+            }, 'Test run succeeded');
+            const totalDurationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+            jobLogger.info({ durationMs: totalDurationMs, attempts: failedAttempts }, 'Test job succeeded');
             recordQueueJob('test', 'succeeded', startedAt);
             return;
           }
@@ -214,13 +247,14 @@ export async function startWorkers(): Promise<WorkerRuntime> {
             lastReason,
           });
 
-          const tuned = tune(level, fail);
+          jobLogger.warn({
+            attempt: round + 1,
+            nodes: result.nodes ?? 0,
+            durationMs: result.durationMs ?? 0,
+            reason: fail.reason,
+          }, 'Test run failed, attempting tune');
 
-          console.log(
-            `[testWorker] attempt=${round + 1} nodes=${result.nodes ?? 0} time=${result.durationMs ?? 0}ms fail=${fail.reason} patch=${
-              tuned?.patch.op ?? 'none'
-            }`,
-          );
+          const tuned = tune(level, fail, jobLogger);
 
           if (!tuned) {
             throw new Error(fail.reason);
@@ -238,6 +272,8 @@ export async function startWorkers(): Promise<WorkerRuntime> {
 
         throw new Error(lastReason ?? 'no_path');
       } catch (error) {
+        const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+        jobLogger.error({ err: error, durationMs, failedAttempts, lastReason }, 'Test job failed');
         const message = toErrorMessage(error);
         await updateJobStatus({
           id: jobId,
@@ -267,21 +303,24 @@ export async function startWorkers(): Promise<WorkerRuntime> {
   );
 
   genWorker.on('failed', (job, error) => {
-    console.error('[genWorker] failed', { jobId: job?.id, error: error?.message });
+    genWorkerLogger.error({ jobId: job?.id, err: error }, 'Generation worker failure event');
   });
   testWorker.on('failed', (job, error) => {
-    console.error('[testWorker] failed', { jobId: job?.id, error: error?.message });
+    testWorkerLogger.error({ jobId: job?.id, err: error }, 'Test worker failure event');
   });
 
   async function close() {
+    queueLogger.info('Closing playtester workers');
     await Promise.allSettled([genWorker.close(), testWorker.close()]);
     await Promise.allSettled([genQueue.close(), testQueue.close()]);
     try {
       await connection.quit();
-    } catch {
+    } catch (error) {
+      queueLogger.warn({ err: error }, 'Failed to quit Redis connection, forcing disconnect');
       connection.disconnect();
     }
     await closeGenerator();
+    queueLogger.info('Playtester workers closed');
   }
 
   return { close };

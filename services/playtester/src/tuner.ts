@@ -1,5 +1,7 @@
 import { Level, LevelT } from '@ir/game-spec';
 
+import type { Logger } from '@ir/logger';
+
 import { Fail, GapDetail, HazardDetail } from './tester';
 
 const MAX_ADJUST_PX = 48;
@@ -337,22 +339,38 @@ function addSpawnPlatform(level: LevelT, fail: Fail): TuneResult | null {
   });
 }
 
-export function tune(level: LevelT, fail: Fail): TuneResult | null {
+export function tune(level: LevelT, fail: Fail, logger: Logger): TuneResult | null {
+  let result: TuneResult | null;
   switch (fail.reason) {
     case 'gap_too_wide':
-      return adjustGap(level, fail);
+      result = adjustGap(level, fail);
+      break;
     case 'hazard_no_window':
-      return adjustHazard(level, fail);
+      result = adjustHazard(level, fail);
+      break;
     case 'hazard_window_small':
-      return widenHazardWindow(level, fail);
+      result = widenHazardWindow(level, fail);
+      break;
     case 'enemy_unavoidable':
-      return adjustEnemy(level, fail);
+      result = adjustEnemy(level, fail);
+      break;
     case 'no_spawn':
-      return addSpawnPlatform(level, fail);
+      result = addSpawnPlatform(level, fail);
+      break;
     case 'no_path':
     case 'timeout':
-      return addHelperPlatform(level, fail);
+      result = addHelperPlatform(level, fail);
+      break;
     default:
-      return null;
+      result = null;
+      break;
   }
+
+  if (result) {
+    logger.info({ patch: result.patch, reason: fail.reason, at: fail.at ?? null }, 'Applied tuner patch');
+  } else {
+    logger.debug({ reason: fail.reason }, 'No tuner patch generated');
+  }
+
+  return result;
 }

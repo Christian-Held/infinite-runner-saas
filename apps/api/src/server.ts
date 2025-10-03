@@ -1,11 +1,12 @@
 import cors from '@fastify/cors';
 import type Database from 'better-sqlite3';
-import Fastify, { type FastifyRequest } from 'fastify';
+import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import type IORedis from 'ioredis';
-import pino from 'pino';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+
+import type { Logger } from '@ir/logger';
 
 import { Ability, Level, getLevelPlan } from '@ir/game-spec';
 
@@ -31,6 +32,7 @@ import {
 } from './db';
 import type { QueueManager } from './queue';
 import { httpRequestDurationSeconds, httpRequestsTotal, registry } from './metrics';
+import type { AppConfig } from './config';
 
 const require = createRequire(import.meta.url);
 const { version: packageVersion } = require('../package.json') as { version?: string };
@@ -40,18 +42,21 @@ interface BuildServerOptions {
   db: Database.Database;
   redis: IORedis;
   queueManager: QueueManager;
+  logger: Logger;
+  config: AppConfig;
+  internalToken: string;
 }
 
-const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN;
-if (!INTERNAL_TOKEN) {
-  throw new Error('INTERNAL_TOKEN must be set');
-}
-
-function requireInternalToken(request: FastifyRequest): void {
-  const token = request.headers['x-internal-token'];
-  if ((Array.isArray(token) ? token[0] : token) !== INTERNAL_TOKEN) {
-    throw new Error('unauthorized');
-  }
+function createInternalTokenHook(expectedToken: string) {
+  return (request: FastifyRequest, reply: FastifyReply) => {
+    const token = request.headers['x-internal-token'];
+    const provided = Array.isArray(token) ? token[0] : token;
+    if (provided !== expectedToken) {
+      request.log.warn({ reqId: request.id }, 'Invalid internal token');
+      reply.status(401).send({ error: 'unauthorized' });
+      return;
+    }
+  };
 }
 
 function extractParams(request: FastifyRequest): Record<string, unknown> {
@@ -151,14 +156,28 @@ const SeasonLevelsQuery = z.object({
   published: z.enum(['true', 'false']).optional(),
 });
 
-export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
-  const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
-  const server = Fastify({ logger });
+export function buildServer({
+  db,
+  redis,
+  queueManager,
+  logger,
+  config,
+  internalToken,
+}: BuildServerOptions) {
+  const server = Fastify({
+    logger: logger.child({ module: 'http' }),
+    genReqId: (request) => {
+      const header = request.headers['x-request-id'];
+      if (typeof header === 'string' && header.length > 0) {
+        return header;
+      }
+      return randomUUID();
+    },
+  });
 
-  const allowedOrigins = (process.env.ORIGIN_ALLOW ?? '')
-    .split(',')
-    .map((origin) => origin.trim())
-    .filter((origin) => origin.length > 0);
+  const requireInternalToken = createInternalTokenHook(internalToken);
+
+  const allowedOrigins = config.originAllowList;
 
   server.register(cors, {
     origin: (origin, callback) => {
@@ -174,12 +193,13 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
     },
   });
 
-  const RATE_WINDOW_MS = Number.parseInt(process.env.RATE_WINDOW_MS ?? '60000', 10);
-  const RATE_MAX = Number.parseInt(process.env.RATE_MAX ?? '30', 10);
-  const RATE_MAX_SEASON = Number.parseInt(process.env.RATE_MAX_SEASON ?? '2', 10);
-  const RATE_WINDOW_SEASON_MS = Number.parseInt(process.env.RATE_WINDOW_SEASON_MS ?? '600000', 10);
-
-  const rateLogger = server.log.child({ module: 'rate-limit' });
+  const rateLogger = logger.child({ module: 'rate-limit' });
+  const {
+    windowMs: RATE_WINDOW_MS,
+    max: RATE_MAX,
+    seasonMax: RATE_MAX_SEASON,
+    seasonWindowMs: RATE_WINDOW_SEASON_MS,
+  } = config.rateLimit;
 
   const ensurePositiveWindow = (windowMs: number) => (Number.isFinite(windowMs) && windowMs > 0 ? windowMs : 60000);
 
@@ -221,7 +241,29 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
       const durationSeconds = Number(process.hrtime.bigint() - metricsStart) / 1_000_000_000;
       httpRequestDurationSeconds.labels(request.method, route, status).observe(durationSeconds);
     }
+    const durationMs = metricsStart
+      ? Number(process.hrtime.bigint() - metricsStart) / 1_000_000
+      : reply.getResponseTime();
+    request.log.info(
+      {
+        reqId: request.id,
+        method: request.method,
+        url: request.url,
+        statusCode: reply.statusCode,
+        durationMs,
+      },
+      'request completed',
+    );
     done();
+  });
+
+  server.setErrorHandler((error, request, reply) => {
+    request.log.error({ err: error }, 'Unhandled error');
+    if (reply.sent) {
+      return;
+    }
+    const statusCode = error.statusCode && error.statusCode >= 400 ? error.statusCode : 500;
+    reply.status(statusCode).send({ error: error.message ?? 'internal_error' });
   });
 
   const getRedisOk = async (): Promise<boolean> => {
@@ -245,6 +287,8 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
       queueManager.getQueueOverview(),
       queueManager.getBudgetStatus(),
     ]);
+
+    server.log.debug({ redisOk, dbOk }, 'Health probes completed');
 
     return {
       status: redisOk && dbOk && budget.ok ? 'ok' : 'degraded',
@@ -413,27 +457,13 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
     reply.send({ seasonId, levels });
   });
 
-  server.post('/internal/levels', async (request, reply) => {
-    try {
-      requireInternalToken(request);
-    } catch {
-      reply.status(401).send({ error: 'unauthorized' });
-      return;
-    }
-
+  server.post('/internal/levels', { preHandler: requireInternalToken }, async (request, reply) => {
     const body = IngestBody.parse(request.body ?? {});
     insertLevel(body.level, { difficulty: body.meta.difficulty, seed: body.meta.seed });
     reply.status(201).send({ id: body.level.id });
   });
 
-  server.post('/internal/levels/meta', async (request, reply) => {
-    try {
-      requireInternalToken(request);
-    } catch {
-      reply.status(401).send({ error: 'unauthorized' });
-      return;
-    }
-
+  server.post('/internal/levels/meta', { preHandler: requireInternalToken }, async (request, reply) => {
     const body = LevelMetaBody.parse(request.body ?? {});
     const level = getLevel(body.level_id);
     if (!level) {
@@ -445,14 +475,7 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
     reply.status(204).send();
   });
 
-  server.post('/internal/jobs', async (request, reply) => {
-    try {
-      requireInternalToken(request);
-    } catch {
-      reply.status(401).send({ error: 'unauthorized' });
-      return;
-    }
-
+  server.post('/internal/jobs', { preHandler: requireInternalToken }, async (request, reply) => {
     const body = InternalJobBody.parse(request.body ?? {});
     insertJob({
       id: body.id,
@@ -463,14 +486,7 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
     reply.status(204).send();
   });
 
-  server.post('/internal/jobs/:id/status', async (request, reply) => {
-    try {
-      requireInternalToken(request);
-    } catch {
-      reply.status(401).send({ error: 'unauthorized' });
-      return;
-    }
-
+  server.post('/internal/jobs/:id/status', { preHandler: requireInternalToken }, async (request, reply) => {
     const params = extractParams(request);
     const id = z.string().parse(params.id);
     const body = UpdateJobBody.parse(request.body ?? {});
@@ -483,14 +499,7 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
     reply.status(204).send();
   });
 
-  server.post('/internal/levels/path', async (request, reply) => {
-    try {
-      requireInternalToken(request);
-    } catch {
-      reply.status(401).send({ error: 'unauthorized' });
-      return;
-    }
-
+  server.post('/internal/levels/path', { preHandler: requireInternalToken }, async (request, reply) => {
     const body = InternalPathBody.parse(request.body ?? {});
     const level = getLevel(body.level_id);
     if (!level) {
@@ -502,14 +511,7 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
     reply.status(204).send();
   });
 
-  server.post('/internal/levels/metrics', async (request, reply) => {
-    try {
-      requireInternalToken(request);
-    } catch {
-      reply.status(401).send({ error: 'unauthorized' });
-      return;
-    }
-
+  server.post('/internal/levels/metrics', { preHandler: requireInternalToken }, async (request, reply) => {
     const body = LevelMetricsBody.parse(request.body ?? {});
     const level = getLevel(body.level_id);
     if (!level) {
@@ -521,14 +523,7 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
     reply.status(204).send();
   });
 
-  server.post('/internal/season-jobs/status', async (request, reply) => {
-    try {
-      requireInternalToken(request);
-    } catch {
-      reply.status(401).send({ error: 'unauthorized' });
-      return;
-    }
-
+  server.post('/internal/season-jobs/status', { preHandler: requireInternalToken }, async (request, reply) => {
     const body = SeasonJobStatusBody.parse(request.body ?? {});
     updateSeasonJob({
       seasonId: body.season_id,
@@ -540,14 +535,7 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
     reply.status(204).send();
   });
 
-  server.post('/internal/levels/patch', async (request, reply) => {
-    try {
-      requireInternalToken(request);
-    } catch {
-      reply.status(401).send({ error: 'unauthorized' });
-      return;
-    }
-
+  server.post('/internal/levels/patch', { preHandler: requireInternalToken }, async (request, reply) => {
     const body = LevelPatchBody.parse(request.body ?? {});
     const existing = getLevel(body.level_id);
     if (!existing) {

@@ -1,28 +1,31 @@
 import 'dotenv/config';
 
+import { createLogger, bindUnhandled } from '@ir/logger';
+
 import { startMetricsServer } from './metrics-server';
 import { startWorkers } from './queue';
 
 async function bootstrap() {
-  const runtime = await startWorkers();
-  console.log('[playtester] Workers for gen/test queues started');
+  const logger = createLogger('playtester');
+  bindUnhandled(logger);
+
+  const runtime = await startWorkers(logger);
+  logger.info('Workers for gen/test queues started');
 
   const metricsPort = Number.parseInt(process.env.METRICS_PORT ?? '9100', 10);
   const metricsServer = await startMetricsServer(metricsPort);
-  console.log(`[playtester] Metrics server listening on :${metricsPort}`);
+  logger.info({ port: metricsPort }, 'Metrics server listening');
 
   if (!process.env.OPENAI_API_KEY) {
-    console.error(
-      '[playtester] OPENAI_API_KEY is not set. Please configure services/playtester/.env and restart.',
+    logger.error(
+      'OPENAI_API_KEY is not set. Please configure services/playtester/.env and restart.',
     );
     await runtime
       .close()
-      .catch((error) =>
-        console.error('[playtester] Failed to close runtime after missing API key', error),
-      );
+      .catch((error) => logger.error({ err: error }, 'Failed to close runtime after missing API key'));
     await metricsServer
       .close()
-      .catch((error) => console.error('[playtester] Failed to stop metrics server', error));
+      .catch((error) => logger.error({ err: error }, 'Failed to stop metrics server'));
     process.exit(1);
   }
 
@@ -32,16 +35,16 @@ async function bootstrap() {
       return;
     }
     shuttingDown = true;
-    console.log(`[playtester] Received ${signal}, shutting down workers`);
+    logger.warn({ signal }, 'Received shutdown signal');
     try {
       await runtime.close();
     } catch (error) {
-      console.error('[playtester] Error during shutdown', error);
+      logger.error({ err: error }, 'Error during shutdown');
     }
     try {
       await metricsServer.close();
     } catch (error) {
-      console.error('[playtester] Failed to close metrics server', error);
+      logger.error({ err: error }, 'Failed to close metrics server');
     }
     process.exit(0);
   };
@@ -50,7 +53,7 @@ async function bootstrap() {
   for (const signal of signals) {
     process.once(signal, () => {
       shutdown(signal).catch((error) => {
-        console.error('[playtester] Shutdown failure', error);
+        logger.fatal({ err: error }, 'Shutdown failure');
         process.exit(1);
       });
     });
@@ -59,7 +62,8 @@ async function bootstrap() {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   bootstrap().catch((error) => {
-    console.error('[playtester] Fatal error during startup', error);
+    const logger = createLogger('playtester');
+    logger.fatal({ err: error }, 'Fatal error during startup');
     process.exit(1);
   });
 }

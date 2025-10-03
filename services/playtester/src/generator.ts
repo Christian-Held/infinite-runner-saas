@@ -13,6 +13,8 @@ import stringify from 'fast-json-stable-stringify';
 import seedrandom from 'seedrandom';
 import { z } from 'zod';
 
+import type { Logger } from '@ir/logger';
+
 import { getOpenAIClient, getRedisClient, closeClients, getModel } from './clients';
 import { trackAndCheck } from './costguard';
 import { scoreLevel, withinBand } from './scoring';
@@ -281,7 +283,7 @@ async function rememberSignature(signature: string, levelId: string): Promise<vo
   await redis.set(key, levelId, 'EX', GEN_SIMHASH_TTL_SEC);
 }
 
-async function callModel(prompt: PromptFragments) {
+async function callModel(prompt: PromptFragments, logger: Logger) {
   const openai = getOpenAIClient();
   const response = await openai.responses.create({
     model: getModel(),
@@ -306,12 +308,15 @@ async function callModel(prompt: PromptFragments) {
       inputTokens: usage.input_tokens ?? 0,
       outputTokens: usage.output_tokens ?? 0,
     });
-    console.info('[generator] usage', {
-      inputTokens: usage.input_tokens ?? 0,
-      outputTokens: usage.output_tokens ?? 0,
-      totalTokens: usage.total_tokens ?? 0,
-      remainingUsd: Number(guardResult.remainingUsd.toFixed(4)),
-    });
+    logger.info(
+      {
+        inputTokens: usage.input_tokens ?? 0,
+        outputTokens: usage.output_tokens ?? 0,
+        totalTokens: usage.total_tokens ?? 0,
+        remainingUsd: Number(guardResult.remainingUsd.toFixed(4)),
+      },
+      'OpenAI usage recorded',
+    );
     if (!guardResult.ok) {
       throw new Error('budget_exceeded');
     }
@@ -323,6 +328,7 @@ export async function generateLevel(
   seed: string,
   difficulty: number,
   abilities: AbilityT | undefined,
+  logger: Logger,
   levelNumber?: number,
   seasonId?: string,
 ): Promise<LevelShape> {
@@ -358,7 +364,8 @@ export async function generateLevel(
     });
 
     try {
-      const raw = await callModel(prompt);
+      logger.debug({ attempt: attempt + 1, seed: attemptSeed }, 'Generating level from model');
+      const raw = await callModel(prompt, logger);
       const candidateJson = extractJson(raw);
       if (!candidateJson) {
         throw new ParseError('Antwort konnte nicht als JSON extrahiert werden.', raw);
@@ -401,6 +408,7 @@ export async function generateLevel(
         enemyCount > plan.constraints.enemyMax
       ) {
         guidance = `Zu viele Gegner (${enemyCount}) gegenüber Maximum ${plan.constraints.enemyMax}. Reduziere die Anzahl.`;
+        logger.debug({ attempt: attempt + 1, guidance }, 'Guidance issued');
         await delay(250);
         continue;
       }
@@ -411,6 +419,7 @@ export async function generateLevel(
       if (disallowedPatterns.length > 0) {
         const used = Array.from(new Set(disallowedPatterns.map((enemy) => enemy.pattern)));
         guidance = `Unzulässige Gegner-Muster gefunden (${used.join(', ')}). Erlaubt sind: ${allowedPatterns.join(', ')}.`;
+        logger.debug({ attempt: attempt + 1, guidance }, 'Guidance issued');
         await delay(250);
         continue;
       }
@@ -421,6 +430,7 @@ export async function generateLevel(
         hazardCount > plan.constraints.hazardMax
       ) {
         guidance = `Gefahren überschreiten das Limit (${hazardCount} > ${plan.constraints.hazardMax}). Bitte reduzieren.`;
+        logger.debug({ attempt: attempt + 1, guidance }, 'Guidance issued');
         await delay(250);
         continue;
       }
@@ -431,6 +441,7 @@ export async function generateLevel(
         movingCount > plan.constraints.movingMax
       ) {
         guidance = `Zu viele bewegliche Elemente (${movingCount} > ${plan.constraints.movingMax}).`;
+        logger.debug({ attempt: attempt + 1, guidance }, 'Guidance issued');
         await delay(250);
         continue;
       }
@@ -449,6 +460,7 @@ export async function generateLevel(
       if (invalidWindow) {
         const [minPeriod, maxPeriod] = hazardWindow.periodRange;
         guidance = `Hazard-Fenster zu knapp oder period_ms außerhalb Range. Stelle open_ms >= ${hazardWindow.minOpenMs} und period_ms ${minPeriod}-${maxPeriod} sicher.`;
+        logger.debug({ attempt: attempt + 1, guidance }, 'Guidance issued');
         await delay(250);
         continue;
       }
@@ -457,6 +469,7 @@ export async function generateLevel(
       if (!withinBand(score, plan.difficultyBand)) {
         const direction = score < plan.difficultyTarget ? 'erhöhe' : 'reduziere';
         guidance = `Schwierigkeitsscore ${score.toFixed(1)} außerhalb Zielband ${plan.difficultyBand[0]}-${plan.difficultyBand[1]} (Ziel ${plan.difficultyTarget}). Bitte ${direction} die Schwierigkeit durch Anpassungen an Lücken, Gegnern, beweglichen Plattformen oder Gefahren.`;
+        logger.debug({ attempt: attempt + 1, guidance }, 'Guidance issued');
         await delay(250);
         continue;
       }
@@ -465,20 +478,24 @@ export async function generateLevel(
       if (await isDuplicate(signature)) {
         guidance =
           'Vorherige Ausgabe duplizierte ein existierendes Layout. Variiere Struktur und Plattform-Anordnung.';
+        logger.debug({ attempt: attempt + 1, guidance }, 'Guidance issued');
         continue;
       }
 
       await rememberSignature(signature, candidateLevel.id);
+      logger.info({ attempt: attempt + 1, levelId: candidateLevel.id }, 'Generated level candidate');
       return candidateLevel;
     } catch (error) {
       if (error instanceof ParseError) {
         guidance =
           'Die letzte Antwort war kein gültiges JSON. Gib ausschließlich gültiges JSON zurück.';
+        logger.warn({ attempt: attempt + 1, guidance }, 'Parse error guidance issued');
         await delay(250);
         continue;
       }
       if (error instanceof z.ZodError) {
         guidance = `Schema-Fehler: ${error.issues.map((issue) => issue.message).join('; ')}`;
+        logger.warn({ attempt: attempt + 1, guidance }, 'Schema validation failed');
         await delay(250);
         continue;
       }
@@ -486,6 +503,7 @@ export async function generateLevel(
     }
   }
 
+  logger.error({ attempts: GEN_MAX_ATTEMPTS, seed, difficulty }, 'Exhausted generation attempts');
   throw new Error('Keine gültige Level-Antwort nach maximalen Versuchen erhalten');
 }
 

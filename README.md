@@ -1,83 +1,151 @@
-# Infinite Runner SaaS Monorepo
+# Infinite Runner SaaS
 
-## Voraussetzungen
-- Node.js LTS (>= 20)
-- pnpm (>= 8)
-- Docker & Docker Compose (für containerisierte Entwicklung)
+Welcome! This guide is written for newcomers who need to stand up the full Infinite Runner SaaS stack without surprises. Follow the steps below exactly the first time you get the repo on a Windows machine using PowerShell.
 
-## Schnellstart Entwicklung
-```bash
-pnpm install
-pnpm dev
-```
-- Web-App erreichbar unter [http://localhost:5173](http://localhost:5173)
-- API erreichbar unter [http://localhost:3000](http://localhost:3000)
-- KI-Playtester-Worker: `pnpm playtester`
+## Quick Start (Windows, PowerShell)
 
-### API-Workflows
-- `GET http://localhost:3000/health` prüft DB- und Redis-Verfügbarkeit.
-- `POST http://localhost:3000/levels/generate` erstellt einen Generierungsjob; die Ausführung übernimmt der Playtester-Service (gen → test).
-- `GET http://localhost:3000/jobs/<jobId>` zeigt den Jobfortschritt (`queued` → `running` → `succeeded`).
-- `GET http://localhost:3000/levels?published=false&limit=5` listet unveröffentlichte Level.
-- `POST http://localhost:3000/levels/<levelId>/publish` setzt das Veröffentlichungsflag.
+> **Tip:** Open PowerShell as Administrator when you need to manage Docker or services. All commands below are safe to copy & paste.
 
-Alle Level-Daten validieren gegen `@ir/game-spec`, persistieren in SQLite (`./apps/api/data/app.db`) und werden über BullMQ/Redis verarbeitet.
+1. **Update your working tree safely**
+   ```powershell
+   git status
+   git stash push --include-untracked --message "wip" # only if you have changes
+   git config --global rebase.autoStash true
+   git pull --rebase
+   git stash pop
+   ```
+2. **Stop any lingering services**
+   ```powershell
+   docker compose down --remove-orphans
+   Get-Process node -ErrorAction SilentlyContinue | Stop-Process -Force
+   ```
+3. **Install dependencies & rebuild native modules**
+   ```powershell
+   pnpm install
+   pnpm -r rebuild better-sqlite3
+   ```
+4. **Prepare infrastructure**
+   ```powershell
+   docker compose up redis -d
+   ```
+5. **Start each service in its own terminal**
+   - **API (Fastify + SQLite):**
+     ```powershell
+     pnpm --filter api run dev:direct
+     ```
+   - **Web (Next.js client):**
+     ```powershell
+     pnpm --filter web dev
+     ```
+   - **Playtester workers:**
+     ```powershell
+     pnpm --filter @srv/playtester dev
+     ```
+6. **Health check**
+   ```powershell
+   Invoke-RestMethod http://localhost:3000/health | Format-List
+   ```
+7. **Smoke test**
+   - Open <http://localhost:3000/internal/demo> in a browser (use `x-internal-token` header via a REST client if calling APIs directly).
+   - Ensure Redis metrics: `http://localhost:9100/metrics`.
 
-### Playtester Service
-- Start: `pnpm playtester` (lokal) oder via Docker Compose.
-- Benötigte Umgebungsvariablen:
-  - `OPENAI_API_KEY` (Pflicht)
-  - `OPENAI_MODEL` (Standard: `gpt-4.1-mini`)
-  - `OPENAI_REQ_TIMEOUT_MS` (Standard: `20000`)
-  - `GEN_MAX_ATTEMPTS` (Standard: `3`)
-  - `GEN_SIMHASH_TTL_SEC` (Standard: `604800`)
-  - `REDIS_URL` (Standard: `redis://redis:6379`)
-  - `API_BASE_URL` (Standard: `http://localhost:3000`)
-  - `INTERNAL_TOKEN` (muss mit der API übereinstimmen, Standard `dev-internal`)
-- Lokale Konfiguration: `.env` im Ordner `services/playtester/` (UTF-8, ohne Anführungszeichen). Änderungen erfordern einen Neustart des Playtester-Services.
-- Queues: `gen` (Concurrency 2) & `test` (Concurrency 4) via BullMQ.
-- Der Worker schreibt Levels und Job-Status über interne API-Endpunkte (`/internal/*`) zurück.
+## "All in Docker" Mode
 
-### Web starten
+To run everything in containers (no local Node processes):
 
-```bash
-pnpm --filter web dev
-```
-
-- Steuerung: Links/Rechts über `A`/`D` oder Pfeiltasten, Sprung via `Leertaste` oder `Pfeil nach oben`, `Esc` pausiert.
-- Ziel: Laufe zum Ausgang, weiche Gefahren aus und erreiche das Levelende so schnell wie möglich.
-
-## Docker-Entwicklung
-```bash
+```powershell
 docker compose up --build
 ```
-- Nutzt lokale Dockerfiles der Pakete
-- Startet Web, API, Playtester-Service sowie Redis. Die API speichert ihren Zustand in einem Docker-Volume (`api-data`).
 
-## Repository-Struktur
+* Containers expose the same ports (API 3000, Web 3001, Metrics 9100).
+* Use `docker compose logs -f <service>` for streaming logs.
+* Stop and clean up with:
+  ```powershell
+  docker compose down --remove-orphans --volumes
+  ```
+
+## Environment Files
+
+Never commit secrets. Always work from the provided `.env.example` templates.
+
+| Location | Purpose | Example safe values |
+| --- | --- | --- |
+| `apps/api/.env` | API defaults (Redis, internal auth). | ```env
+REDIS_URL=redis://localhost:6379
+INTERNAL_TOKEN=dev-internal
+LOG_LEVEL=debug
+``` |
+| `services/playtester/.env` | Worker credentials (OpenAI key, Redis). | ```env
+OPENAI_API_KEY=sk-your-dev-token
+REDIS_URL=redis://localhost:6379
+TUNE_MAX_ROUNDS=3
+``` |
+
+> ⚠️ **Do not commit secrets.** Keep `.env` files out of Git (`.gitignore` already does).
+
+## Commands Reference
+
+| Service | Command (PowerShell) | Port(s) | Notes |
+| --- | --- | --- | --- |
+| API | `pnpm --filter api run dev:direct` | 3000 | Logs in `.logs/api-*.log` and stdout. |
+| Web | `pnpm --filter web dev` | 3001 | Next.js dev server. |
+| Playtester | `pnpm --filter @srv/playtester dev` | 9100 (metrics) | Worker logs in `.logs/playtester-*.log`. |
+| Redis (Docker) | `docker compose up redis -d` | 6379 | Data stored in Docker volume `infinite-runner-saas_redis-data`. |
+
+Log files (if enabled) live under `.logs/*.log`. Rotate daily per service. Use `Get-Content .\.logs\api-$(Get-Date -Format 'yyyy-MM-dd').log -Wait` to tail in PowerShell.
+
+## Reset & Recovery Recipes
+
+| Situation | Command(s) |
+| --- | --- |
+| Free port 3000 | `Get-Process -Id (Get-NetTCPConnection -LocalPort 3000).OwningProcess | Stop-Process -Force` |
+| Restart Docker Desktop service | `Restart-Service com.docker.service` (run as Administrator) |
+| Clear local SQLite data | `Remove-Item apps\api\data\*.db -Force` then rerun migrations via `pnpm --filter api migrate` |
+| Fresh Redis state | `docker compose down --volumes` followed by `docker compose up redis -d` |
+
+## Troubleshooting Matrix
+
+| Symptom | Likely Cause | Fix |
+| --- | --- | --- |
+| API unreachable (`ECONNREFUSED`) | API not running or port blocked. | Restart API terminal, ensure port 3000 free, re-run health check. |
+| Queue stuck in `queued` | Redis unreachable or workers down. | Verify Redis container (`docker ps`), restart playtester service. |
+| `OPENAI_API_KEY` missing warning | Playtester started without key. | Add key to `services/playtester/.env`, restart worker. |
+| Redis URL mismatch between services | Different `REDIS_URL` envs. | Align `.env` values and restart API + workers. |
+| HTTP 401 on `/internal/*` | Wrong `x-internal-token`. | Confirm token from `.env` matches request header. |
+
+## Testing & Coverage
+
+* Run every workspace test: `pnpm -r test` (falls back to each package's `test` script when defined).
+* API unit tests (Vitest):
+  ```powershell
+  pnpm --filter api exec vitest run
+  pnpm --filter api exec vitest run --coverage
+  ```
+* Playtester tests (Vitest, individual):
+  ```powershell
+  pnpm --filter @srv/playtester exec vitest run
+  ```
+
+## Repository Map
+
 ```
-.
-├── apps
-│   ├── api
-│   └── web
-├── services
-│   └── playtester
-├── docker-compose.yml
-├── tsconfig.base.json
-└── package.json
+apps/            # Frontend (web) and backend (api)
+packages/        # Shared libraries (game spec, logger)
+services/        # Long-running workers (playtester)
+.logs/           # Daily-rotated service logs (created on demand)
+deploy/          # Deployment manifests & scripts
+scripts/         # Windows helper scripts
 ```
 
-## Weitere Skripte
-- `pnpm build` – baut alle Workspaces
-- `pnpm lint` – führt ESLint in allen Workspaces aus
-- `pnpm format` – führt Prettier im Check-Modus in allen Workspaces aus
+### Data Locations
 
-## Umgebung
-- `OPENAI_API_KEY` – API-Schlüssel für OpenAI-basierte Generierung
-- `OPENAI_MODEL=gpt-4.1-mini` – Vorgabemodell für den Generator
-- `OPENAI_REQ_TIMEOUT_MS=20000` – Timeout für OpenAI-Anfragen (ms)
-- `GEN_MAX_ATTEMPTS=3` – Maximale Generierungsversuche
-- `GEN_SIMHASH_TTL_SEC=604800` – TTL für Layout-Signaturen (Sekunden)
-- `REDIS_URL=redis://redis:6379` – Verbindung zur Redis-Instanz aus Docker Compose
-- `DB_PATH=./data/app.db` – Speicherort der SQLite-Datenbank (Standard)
-- `INTERNAL_TOKEN=dev-internal` – Shared Secret für interne API-Aufrufe (Playtester ↔ API)
+* SQLite files: `apps/api/data/*.db`
+* Redis state: Docker volume `infinite-runner-saas_redis-data`
+* Metrics snapshots: Export via Prometheus scrape (`/metrics` endpoints)
+
+## Security Notes
+
+* `INTERNAL_TOKEN` secures all `/internal/*` API routes. In development, the server defaults to `dev-internal`. In production set a strong random string and **never** share it publicly.
+* Store real secrets in a secure vault. Treat `.env` files as developer-only artifacts.
+
+Happy building! Reach out in Slack `#infinite-runner` if you get stuck.
