@@ -1,7 +1,14 @@
 import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { Ability, Level, getLevelPlan } from '@ir/game-spec';
+import {
+  Ability,
+  Level,
+  getBiome,
+  getLevelPlan,
+  type Biome,
+  type BiomeParams,
+} from '@ir/game-spec';
 import stringify from 'fast-json-stable-stringify';
 import seedrandom from 'seedrandom';
 import { z } from 'zod';
@@ -48,6 +55,43 @@ class ParseError extends Error {
     super(message);
     this.name = 'ParseError';
   }
+}
+
+type EnemyPattern = 'patrol' | 'chase' | 'projectile';
+
+interface HazardWindowConfig {
+  minOpenMs: number;
+  periodRange: [number, number];
+}
+
+function formatColorHex(color: number): string {
+  return `#${color.toString(16).padStart(6, '0')}`;
+}
+
+function allowedEnemyPatternsForLevel(levelNumber: number): EnemyPattern[] {
+  if (levelNumber >= 35) {
+    return ['patrol', 'chase', 'projectile'];
+  }
+  if (levelNumber >= 20) {
+    return ['patrol', 'chase'];
+  }
+  return ['patrol'];
+}
+
+function hazardWindowForLevel(levelNumber: number): HazardWindowConfig {
+  const t = Math.min(Math.max((levelNumber - 1) / 99, 0), 1);
+  const interpolated = 320 - (320 - 180) * t;
+  const minOpenMs = Math.max(180, Math.round(interpolated));
+  return { minOpenMs, periodRange: [800, 2200] };
+}
+
+function describeBiome(name: Biome, params: BiomeParams): string[] {
+  const palette = params.palette;
+  return [
+    `Biome: ${name}`,
+    `Palette BG ${formatColorHex(palette.bg)}, Plattform ${formatColorHex(palette.platform)}, Hazard ${formatColorHex(palette.hazard)}, Akzent ${formatColorHex(palette.accent)}`,
+    `Hinweise: Bodenreibung ${params.friction.toFixed(2)}, Hazard-Bias ${params.ambientHazardBias.toFixed(2)}, Moving-Bias ${params.movingBias.toFixed(2)}`,
+  ];
 }
 
 function buildMiniExample(
@@ -120,6 +164,9 @@ export function makePrompt(
       jetpack?: { fuel: number; thrust: number } | undefined;
     };
     seasonId?: string;
+    biome?: { name: Biome; params: BiomeParams };
+    enemyPatterns?: EnemyPattern[];
+    hazardWindow?: HazardWindowConfig;
   },
 ): PromptFragments {
   const abilitySummary = JSON.stringify(abilities);
@@ -155,12 +202,24 @@ export function makePrompt(
     if (limits.jetpack) {
       limitLines.push(`- Jetpack-Fuel: ${limits.jetpack.fuel} (Thrust ${limits.jetpack.thrust})`);
     }
+    const biomeLines = planDetails.biome ? describeBiome(planDetails.biome.name, planDetails.biome.params) : [];
+    const patternLine = planDetails.enemyPatterns?.length
+      ? [`Erlaubte Gegner-Muster: ${planDetails.enemyPatterns.join(', ')}`]
+      : [];
+    const hazardWindowLine = planDetails.hazardWindow
+      ? [
+          `Bewegende Gefahren: period_ms ${planDetails.hazardWindow.periodRange[0]}-${planDetails.hazardWindow.periodRange[1]} und offene Fenster >= ${planDetails.hazardWindow.minOpenMs} ms (Nutze open_ms für das Fenster).`,
+        ]
+      : [];
     userParts.push(
       `Level-Nummer: ${planDetails.levelNumber} / 100`,
       `Season: ${planDetails.seasonId ?? 'standalone'}`,
       `Ziel-Schwierigkeitsscore: ${planDetails.difficultyTarget} (Band ${bandMin}-${bandMax})`,
       'Grenzwerte für Inhalte:',
       ...limitLines,
+      ...biomeLines,
+      ...patternLine,
+      ...hazardWindowLine,
     );
   }
 
@@ -275,6 +334,9 @@ export async function generateLevel(
     minPlatformWidthPX: plan.constraints.minPlatformWidthPX,
     maxStepUpPX: plan.constraints.maxStepUpPX,
   };
+  const { biome, params: biomeParams } = getBiome(plan.levelNumber);
+  const allowedPatterns = allowedEnemyPatternsForLevel(plan.levelNumber);
+  const hazardWindow = hazardWindowForLevel(plan.levelNumber);
   let guidance = '';
 
   for (let attempt = 0; attempt < GEN_MAX_ATTEMPTS; attempt += 1) {
@@ -290,6 +352,9 @@ export async function generateLevel(
         jetpack: plan.constraints.jetpack,
       },
       seasonId,
+      biome: { name: biome, params: biomeParams },
+      enemyPatterns: allowedPatterns,
+      hazardWindow,
     });
 
     try {
@@ -329,6 +394,64 @@ export async function generateLevel(
       candidateLevel.rules.abilities = parsedAbilities;
       candidateLevel.rules.duration_target_s = planConstraints.targetDurationSec;
       candidateLevel.seed = attemptSeed;
+
+      const enemyCount = candidateLevel.enemies?.length ?? 0;
+      if (
+        typeof plan.constraints.enemyMax === 'number' &&
+        enemyCount > plan.constraints.enemyMax
+      ) {
+        guidance = `Zu viele Gegner (${enemyCount}) gegenüber Maximum ${plan.constraints.enemyMax}. Reduziere die Anzahl.`;
+        await delay(250);
+        continue;
+      }
+
+      const disallowedPatterns = (candidateLevel.enemies ?? []).filter(
+        (enemy) => !allowedPatterns.includes(enemy.pattern as EnemyPattern),
+      );
+      if (disallowedPatterns.length > 0) {
+        const used = Array.from(new Set(disallowedPatterns.map((enemy) => enemy.pattern)));
+        guidance = `Unzulässige Gegner-Muster gefunden (${used.join(', ')}). Erlaubt sind: ${allowedPatterns.join(', ')}.`;
+        await delay(250);
+        continue;
+      }
+
+      const hazardCount = candidateLevel.tiles.filter((tile) => tile.type === 'hazard').length;
+      if (
+        typeof plan.constraints.hazardMax === 'number' &&
+        hazardCount > plan.constraints.hazardMax
+      ) {
+        guidance = `Gefahren überschreiten das Limit (${hazardCount} > ${plan.constraints.hazardMax}). Bitte reduzieren.`;
+        await delay(250);
+        continue;
+      }
+
+      const movingCount = candidateLevel.moving?.length ?? 0;
+      if (
+        typeof plan.constraints.movingMax === 'number' &&
+        movingCount > plan.constraints.movingMax
+      ) {
+        guidance = `Zu viele bewegliche Elemente (${movingCount} > ${plan.constraints.movingMax}).`;
+        await delay(250);
+        continue;
+      }
+
+      const invalidWindow = (candidateLevel.moving ?? []).find((entry) => {
+        if (typeof entry.open_ms !== 'number') {
+          return false;
+        }
+        if (entry.open_ms < hazardWindow.minOpenMs) {
+          return true;
+        }
+        const [minPeriod, maxPeriod] = hazardWindow.periodRange;
+        return entry.period_ms < minPeriod || entry.period_ms > maxPeriod;
+      });
+
+      if (invalidWindow) {
+        const [minPeriod, maxPeriod] = hazardWindow.periodRange;
+        guidance = `Hazard-Fenster zu knapp oder period_ms außerhalb Range. Stelle open_ms >= ${hazardWindow.minOpenMs} und period_ms ${minPeriod}-${maxPeriod} sicher.`;
+        await delay(250);
+        continue;
+      }
 
       const score = scoreLevel(candidateLevel);
       if (!withinBand(score, plan.difficultyBand)) {

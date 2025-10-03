@@ -12,7 +12,10 @@ import { Ability, Level, getLevelPlan } from '@ir/game-spec';
 import {
   getJob,
   getLevel,
+  getLevelMeta,
   getLevelPath,
+  getLevelMetric,
+  getSeasonStatus,
   insertJob,
   insertLevel,
   insertLevelRevision,
@@ -20,12 +23,11 @@ import {
   listSeasonLevels,
   pingDb,
   updateLevel,
+  upsertLevelMeta,
+  upsertLevelMetric,
   upsertLevelPath,
   updateJobStatus,
   updateSeasonJob,
-  upsertLevelMetric,
-  getLevelMetric,
-  getSeasonStatus,
 } from './db';
 import type { QueueManager } from './queue';
 import { httpRequestDurationSeconds, httpRequestsTotal, registry } from './metrics';
@@ -112,9 +114,16 @@ const LevelPatchBody = z.object({
   level: Level,
 });
 
+const BiomeEnum = z.enum(['meadow', 'cave', 'factory', 'lava', 'sky']);
+
 const LevelMetricsBody = z.object({
   level_id: z.string(),
   score: z.number(),
+});
+
+const LevelMetaBody = z.object({
+  level_id: z.string(),
+  biome: BiomeEnum,
 });
 
 const SeasonJobStatusEnum = z.enum(['queued', 'running', 'failed', 'succeeded']);
@@ -326,6 +335,17 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
     reply.send(level);
   });
 
+  server.get('/levels/:id/meta', async (request, reply) => {
+    const params = extractParams(request);
+    const id = z.string().parse(params.id);
+    const meta = getLevelMeta(id);
+    if (!meta) {
+      reply.status(404).send({ error: 'not_found' });
+      return;
+    }
+    reply.send({ biome: meta.biome });
+  });
+
   server.get('/levels/:id/metrics', async (request, reply) => {
     const params = extractParams(request);
     const id = z.string().parse(params.id);
@@ -404,6 +424,25 @@ export function buildServer({ db, redis, queueManager }: BuildServerOptions) {
     const body = IngestBody.parse(request.body ?? {});
     insertLevel(body.level, { difficulty: body.meta.difficulty, seed: body.meta.seed });
     reply.status(201).send({ id: body.level.id });
+  });
+
+  server.post('/internal/levels/meta', async (request, reply) => {
+    try {
+      requireInternalToken(request);
+    } catch {
+      reply.status(401).send({ error: 'unauthorized' });
+      return;
+    }
+
+    const body = LevelMetaBody.parse(request.body ?? {});
+    const level = getLevel(body.level_id);
+    if (!level) {
+      reply.status(404).send({ error: 'level_not_found' });
+      return;
+    }
+
+    upsertLevelMeta(body.level_id, body.biome);
+    reply.status(204).send();
   });
 
   server.post('/internal/jobs', async (request, reply) => {

@@ -71,11 +71,11 @@ function computeHazardExposure(level: LevelT): number {
 }
 
 function computeMovingTightness(level: LevelT): number {
-  return level.moving.filter((platform) => {
+  return (level.moving ?? []).filter((platform) => {
     const [fromX, fromY] = platform.from;
     const [toX, toY] = platform.to;
     const travelDistance = Math.hypot(toX - fromX, toY - fromY);
-    const windowMs = platform.period_ms;
+    const windowMs = typeof platform.open_ms === 'number' ? platform.open_ms : platform.period_ms;
     if (travelDistance <= 0) {
       return false;
     }

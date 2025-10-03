@@ -1,16 +1,24 @@
 import Phaser from 'phaser';
 
-import { LevelT } from '@ir/game-spec';
+import {
+  LevelT,
+  getBiome,
+  getBiomeByName,
+  type Biome,
+  type BiomeParams,
+} from '@ir/game-spec';
 
 import { playGhost, type GhostPlayback } from '../game/Ghost';
 import {
   fetchApproved,
   fetchLevel,
+  fetchLevelMeta,
   fetchLevelPath,
   fetchSeasonLevels,
   type InputCmd,
   type LevelSummary,
   type SeasonLevelEntry,
+  type LevelMeta,
 } from '../level/loader';
 import { clearProgress, saveProgress } from '../level/progress';
 import { RUNNER_CONSTANTS } from '../types/game';
@@ -19,6 +27,20 @@ const DEFAULT_WORLD_HEIGHT = 720;
 const EXIT_WIDTH = 40;
 const EXIT_HEIGHT = 80;
 const PLAYER_START_OFFSET_Y = 140;
+
+function toCss(color: number): string {
+  return `#${color.toString(16).padStart(6, '0')}`;
+}
+
+function mixColor(base: number, target: number, t: number): number {
+  const from = Phaser.Display.Color.IntegerToRGB(base);
+  const to = Phaser.Display.Color.IntegerToRGB(target);
+  const clamped = Phaser.Math.Clamp(t, 0, 1);
+  const r = Math.round(Phaser.Math.Linear(from.r, to.r, clamped));
+  const g = Math.round(Phaser.Math.Linear(from.g, to.g, clamped));
+  const b = Math.round(Phaser.Math.Linear(from.b, to.b, clamped));
+  return Phaser.Display.Color.GetColor(r, g, b);
+}
 
 type StaticSprite = Phaser.Physics.Arcade.Sprite & {
   body: Phaser.Physics.Arcade.StaticBody;
@@ -50,6 +72,9 @@ export class GameScene extends Phaser.Scene {
   private levelData!: LevelT;
   private worldWidth = 0;
   private worldHeight = DEFAULT_WORLD_HEIGHT;
+  private biomeTheme: { name: Biome; params: BiomeParams } | null = null;
+  private palette: BiomeParams['palette'] | null = null;
+  private backgroundLayers: Phaser.GameObjects.Rectangle[] = [];
 
   private seasonEntries: SeasonLevelEntry[] = [];
   private approvedLevels: LevelSummary[] = [];
@@ -71,9 +96,12 @@ export class GameScene extends Phaser.Scene {
   private hudLevelText!: Phaser.GameObjects.Text;
   private hudTimerText!: Phaser.GameObjects.Text;
   private hudAbilitiesText!: Phaser.GameObjects.Text;
+  private hudBiomeText!: Phaser.GameObjects.Text;
   private hudRetryText!: Phaser.GameObjects.Text;
   private loadingText!: Phaser.GameObjects.Text;
   private pauseOverlay!: Phaser.GameObjects.Container;
+  private pauseBackground!: Phaser.GameObjects.Rectangle;
+  private pauseButtons: Phaser.GameObjects.Text[] = [];
 
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
   private keyA!: Phaser.Input.Keyboard.Key;
@@ -159,6 +187,10 @@ export class GameScene extends Phaser.Scene {
       this.currentLevelId = target.levelId;
       this.currentLevelTitle = target.title;
 
+      const meta = await fetchLevelMeta(level.id);
+      const theme = this.resolveBiomeTheme(target.levelNumber, meta);
+      this.applyBiomeTheme(theme);
+
       this.setupLevel();
       this.setupPlayer();
       this.setupCamera();
@@ -227,6 +259,13 @@ export class GameScene extends Phaser.Scene {
     if (this.exitZone) {
       this.exitZone.destroy();
     }
+
+    this.backgroundLayers.forEach((layer) => layer.destroy());
+    this.backgroundLayers = [];
+    this.palette = null;
+    this.biomeTheme = null;
+    this.refreshHudPalette();
+    this.tintPauseMenu();
   }
 
   private async resolveCurrentLevelTarget(): Promise<LevelTarget> {
@@ -332,6 +371,114 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
+  private resolveBiomeTheme(levelNumber: number, meta: LevelMeta | null): {
+    name: Biome;
+    params: BiomeParams;
+  } {
+    if (meta && meta.biome) {
+      return getBiomeByName(meta.biome);
+    }
+    return getBiome(levelNumber);
+  }
+
+  private applyBiomeTheme(theme: { name: Biome; params: BiomeParams }): void {
+    this.biomeTheme = theme;
+    this.palette = theme.params.palette;
+    this.refreshHudPalette();
+    this.tintPauseMenu();
+    this.rebuildBackground();
+  }
+
+  private paletteColor(key: keyof BiomeParams['palette'], fallback: number): number {
+    return this.palette ? this.palette[key] : fallback;
+  }
+
+  private refreshHudPalette(): void {
+    if (!this.hudLevelText || !this.hudTimerText || !this.hudAbilitiesText || !this.hudRetryText || !this.hudBiomeText) {
+      return;
+    }
+
+    if (!this.palette) {
+      this.hudLevelText.setColor('#f8fafc');
+      this.hudTimerText.setColor('#f8fafc');
+      this.hudAbilitiesText.setColor('#e2e8f0');
+      this.hudRetryText.setColor('#94a3b8');
+      this.hudBiomeText.setColor('#cbd5f5');
+      return;
+    }
+
+    const palette = this.palette;
+    const titleColor = toCss(mixColor(palette.accent, 0xffffff, 0.25));
+    const timerColor = toCss(mixColor(palette.hazard, 0xffffff, 0.35));
+    const infoColor = toCss(mixColor(palette.platform, 0xffffff, 0.4));
+    const retryColor = toCss(mixColor(palette.bg, 0x000000, 0.6));
+
+    this.hudLevelText.setColor(titleColor);
+    this.hudTimerText.setColor(timerColor);
+    this.hudAbilitiesText.setColor(infoColor);
+    this.hudRetryText.setColor(retryColor);
+    this.hudBiomeText.setColor(titleColor);
+  }
+
+  private tintPauseMenu(): void {
+    if (!this.pauseBackground) {
+      return;
+    }
+
+    if (!this.palette) {
+      this.pauseBackground.setFillStyle(0x020617, 0.85);
+      this.pauseButtons.forEach((button) => {
+        button.setData('baseColor', '#1e293b');
+        button.setData('hoverColor', '#334155');
+        button.setStyle({ backgroundColor: '#1e293b' });
+      });
+      return;
+    }
+
+    const palette = this.palette;
+    const overlayColor = mixColor(palette.bg, 0x000000, 0.55);
+    this.pauseBackground.setFillStyle(overlayColor, 0.85);
+    const base = toCss(mixColor(palette.platform, 0x000000, 0.35));
+    const hover = toCss(mixColor(palette.accent, 0xffffff, 0.2));
+    this.pauseButtons.forEach((button) => {
+      button.setData('baseColor', base);
+      button.setData('hoverColor', hover);
+      button.setStyle({ backgroundColor: base, color: '#f8fafc' });
+    });
+  }
+
+  private rebuildBackground(): void {
+    this.backgroundLayers.forEach((layer) => layer.destroy());
+    this.backgroundLayers = [];
+
+    const camera = this.cameras.main;
+    if (!this.palette) {
+      camera.setBackgroundColor(0x0f172a);
+      return;
+    }
+
+    const palette = this.palette;
+    camera.setBackgroundColor(palette.bg);
+    const width = Math.max(this.worldWidth, this.scale.width * 2);
+    const height = Math.max(this.worldHeight, DEFAULT_WORLD_HEIGHT);
+
+    const layers = [
+      { color: mixColor(palette.bg, 0xffffff, 0.08), alpha: 0.45, scroll: 0.1, depth: -40, heightScale: 1.4 },
+      { color: mixColor(palette.platform, palette.bg, 0.3), alpha: 0.32, scroll: 0.22, depth: -30, heightScale: 1.25 },
+      { color: mixColor(palette.hazard, palette.bg, 0.55), alpha: 0.24, scroll: 0.38, depth: -20, heightScale: 1.15 },
+      { color: mixColor(palette.accent, 0xffffff, 0.12), alpha: 0.2, scroll: 0.52, depth: -15, heightScale: 1.05 },
+    ];
+
+    layers.forEach((layer, index) => {
+      const rect = this.add
+        .rectangle(0, 0, width * 1.05, height * layer.heightScale, layer.color, layer.alpha)
+        .setOrigin(0, 0)
+        .setScrollFactor(layer.scroll, layer.scroll * 0.6 + 0.2)
+        .setDepth(layer.depth - index);
+      this.backgroundLayers.push(rect);
+    });
+  }
+
   private setupInput(): void {
     this.cursors = this.input.keyboard.createCursorKeys();
     this.keyA = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.A);
@@ -354,6 +501,7 @@ export class GameScene extends Phaser.Scene {
     this.worldHeight = height;
 
     this.physics.world.setBounds(0, 0, width, height);
+    this.rebuildBackground();
 
     this.platforms = this.physics.add.staticGroup();
     this.hazards = this.physics.add.staticGroup();
@@ -375,6 +523,7 @@ export class GameScene extends Phaser.Scene {
       'exit',
     );
     exitSprite.setDisplaySize(EXIT_WIDTH, EXIT_HEIGHT).refreshBody();
+    exitSprite.setTint(this.paletteColor('accent', 0x22c55e));
     this.exitZone = exitSprite as StaticSprite;
   }
 
@@ -391,6 +540,7 @@ export class GameScene extends Phaser.Scene {
       RUNNER_CONSTANTS.moveSpeed,
       Math.abs(RUNNER_CONSTANTS.jumpVelocity) * 1.5,
     );
+    player.setTint(this.paletteColor('accent', 0x38bdf8));
 
     const body = player.body as Phaser.Physics.Arcade.Body;
     body.setSize(player.width * 0.6, player.height);
@@ -418,7 +568,7 @@ export class GameScene extends Phaser.Scene {
   private setupCamera(): void {
     const camera = this.cameras.main;
     camera.setBounds(0, 0, this.worldWidth, this.worldHeight);
-    camera.setBackgroundColor(0x0f172a);
+    camera.setBackgroundColor(this.paletteColor('bg', 0x0f172a));
     camera.startFollow(this.player, true, 0.12, 0.12);
     camera.setDeadzone(200, 120);
     camera.setRoundPixels(true);
@@ -610,6 +760,16 @@ export class GameScene extends Phaser.Scene {
       .setScrollFactor(0)
       .setDepth(100);
 
+    this.hudBiomeText = this.add
+      .text(this.scale.width - 16, 48, '', {
+        fontSize: '16px',
+        fontFamily: 'system-ui, sans-serif',
+        color: '#cbd5f5',
+      })
+      .setOrigin(1, 0)
+      .setScrollFactor(0)
+      .setDepth(100);
+
     this.hudRetryText = this.add
       .text(16, this.scale.height - 32, '[R] Neustart  ·  [Esc] Pause', {
         fontSize: '16px',
@@ -629,6 +789,8 @@ export class GameScene extends Phaser.Scene {
       .setScrollFactor(0)
       .setDepth(300)
       .setVisible(false);
+
+    this.refreshHudPalette();
   }
 
   private createPauseMenu(): void {
@@ -643,11 +805,16 @@ export class GameScene extends Phaser.Scene {
     const retryButton = this.createPauseButton('Retry', 20, () => this.restartLevel());
     const quitButton = this.createPauseButton('Quit', 80, () => this.quitToMenu());
 
+    this.pauseBackground = background;
+    this.pauseButtons = [resumeButton, retryButton, quitButton];
+
     this.pauseOverlay = this.add
       .container(width / 2, height / 2, [background, resumeButton, retryButton, quitButton])
       .setDepth(400)
       .setScrollFactor(0)
       .setVisible(false);
+
+    this.tintPauseMenu();
   }
 
   private createPauseButton(
@@ -667,8 +834,16 @@ export class GameScene extends Phaser.Scene {
       .setInteractive({ useHandCursor: true });
 
     button.on('pointerdown', onClick);
-    button.on('pointerover', () => button.setStyle({ backgroundColor: '#334155' }));
-    button.on('pointerout', () => button.setStyle({ backgroundColor: '#1e293b' }));
+    button.setData('baseColor', '#1e293b');
+    button.setData('hoverColor', '#334155');
+    button.on('pointerover', () => {
+      const hover = button.getData('hoverColor') as string | undefined;
+      button.setStyle({ backgroundColor: hover ?? '#334155' });
+    });
+    button.on('pointerout', () => {
+      const base = button.getData('baseColor') as string | undefined;
+      button.setStyle({ backgroundColor: base ?? '#1e293b' });
+    });
 
     return button;
   }
@@ -680,6 +855,7 @@ export class GameScene extends Phaser.Scene {
     );
     this.hudTimerText.setText(`Zeit: ${elapsed.toFixed(2)}s`);
     this.hudAbilitiesText.setText(`Abilities: ${this.formatAbilities()}`);
+    this.hudBiomeText.setText(`Biome: ${this.biomeTheme?.name ?? 'n/a'}`);
   }
 
   private formatSeasonLabel(): string {
@@ -728,6 +904,13 @@ export class GameScene extends Phaser.Scene {
     const sprite = group.create(tile.x + tile.w / 2, tile.y + tile.h / 2, texture) as StaticSprite;
     sprite.setDisplaySize(tile.w, tile.h);
     sprite.refreshBody();
+    if (this.palette) {
+      if (tile.type === 'hazard') {
+        sprite.setTint(this.palette.hazard);
+      } else {
+        sprite.setTint(this.palette.platform);
+      }
+    }
   }
 
   private formatAbilities(): string {

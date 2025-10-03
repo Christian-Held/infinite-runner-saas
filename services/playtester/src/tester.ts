@@ -1,4 +1,4 @@
-import { LevelT } from '@ir/game-spec';
+import { LevelT, getLevelPlan } from '@ir/game-spec';
 
 import { InputCmd, InputState, createSpawn, maxJumpGapPX, simulate } from './sim/arcade';
 import { findPath } from './sim/search';
@@ -6,10 +6,24 @@ import { findPath } from './sim/search';
 const WALKABLE_TILE_TYPES: LevelT['tiles'][number]['type'][] = ['ground', 'platform'];
 const SAFETY_GAP_PX = 16;
 const MIN_PLATFORM_WIDTH = 48;
+const HAZARD_PERIOD_RANGE: [number, number] = [800, 2200];
+
+function minHazardOpeningMs(levelNumber: number): number {
+  const t = Math.min(Math.max((levelNumber - 1) / 99, 0), 1);
+  const interpolated = 320 - (320 - 180) * t;
+  return Math.max(160, Math.round(interpolated));
+}
+
+function movingCenter(moving: LevelT['moving'][number]): { x: number; y: number } {
+  const [fromX, fromY] = moving.from;
+  const [toX, toY] = moving.to;
+  return { x: (fromX + toX) / 2, y: (fromY + toY) / 2 };
+}
 
 export type FailReason =
   | 'gap_too_wide'
   | 'hazard_no_window'
+  | 'hazard_window_small'
   | 'enemy_unavoidable'
   | 'no_spawn'
   | 'no_path'
@@ -233,6 +247,43 @@ function runPrechecks(level: LevelT): PrecheckOutcome {
               tileIndex: hazard.index,
               tile: { ...hazard.tile },
             } satisfies HazardDetail,
+          },
+        },
+      };
+    }
+  }
+
+  const plan = getLevelPlan(level.rules.difficulty ?? 1);
+  const minOpening = minHazardOpeningMs(plan.levelNumber);
+  const [minPeriod, maxPeriod] = HAZARD_PERIOD_RANGE;
+
+  for (const [index, moving] of (level.moving ?? []).entries()) {
+    if (typeof moving.open_ms !== 'number') {
+      continue;
+    }
+    if (
+      moving.open_ms < minOpening ||
+      moving.period_ms < minPeriod ||
+      moving.period_ms > maxPeriod
+    ) {
+      const center = movingCenter(moving);
+      return {
+        ok: false,
+        fail: {
+          ok: false,
+          reason: 'hazard_window_small',
+          at: center,
+          details: {
+            movingIndex: index,
+            moving: {
+              id: moving.id,
+              from: [...moving.from],
+              to: [...moving.to],
+              period_ms: moving.period_ms,
+              open_ms: moving.open_ms,
+            },
+            minOpeningMs: minOpening,
+            periodRange: [minPeriod, maxPeriod],
           },
         },
       };

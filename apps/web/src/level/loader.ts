@@ -1,4 +1,4 @@
-import { Level, LevelT } from '@ir/game-spec';
+import { Level, LevelT, type Biome } from '@ir/game-spec';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3000';
 
@@ -45,6 +45,10 @@ export type InputCmd = {
   fly?: boolean;
   thrust?: boolean;
 };
+
+export interface LevelMeta {
+  biome: Biome;
+}
 
 export interface SeasonLevelEntry {
   seasonId: string;
@@ -152,6 +156,28 @@ export async function fetchLevel(id: string): Promise<LevelT> {
     const level = Level.parse(LOCAL_DEMO_LEVEL);
     console.info(`Level validiert: ${level.id}`);
     return level;
+  }
+}
+
+export async function fetchLevelMeta(id: string): Promise<LevelMeta | null> {
+  const url = `${API_BASE_URL}/levels/${id}/meta`;
+  try {
+    const response = await fetch(url);
+    if (response.status === 404) {
+      return null;
+    }
+    if (!response.ok) {
+      throw new Error(`Failed with ${response.status} ${response.statusText}`);
+    }
+
+    const payload = (await response.json()) as { biome?: unknown };
+    if (typeof payload?.biome === 'string') {
+      return { biome: payload.biome as Biome };
+    }
+    return null;
+  } catch (error) {
+    logLoaderError(`Konnte Level-Metadaten für ${id} nicht laden.`, error);
+    return null;
   }
 }
 

@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { Level, LevelT } from '@ir/game-spec';
+import { Level, LevelT, type Biome } from '@ir/game-spec';
 
 export type JobType = 'gen' | 'test';
 export type JobStatus = 'queued' | 'running' | 'failed' | 'succeeded';
@@ -63,6 +63,11 @@ export interface LevelRecord {
   updatedAt: number;
 }
 
+export interface LevelMetaRecord {
+  levelId: string;
+  biome: Biome;
+}
+
 interface LevelRow {
   id: string;
   seed: string;
@@ -77,6 +82,11 @@ interface LevelRow {
   published: number;
   created_at: number;
   updated_at: number;
+}
+
+interface LevelMetaRow {
+  level_id: string;
+  biome: string;
 }
 
 interface JobRow {
@@ -219,6 +229,27 @@ export function insertLevel(level: LevelT, meta: { difficulty: number; seed: str
     now,
     now,
   );
+}
+
+export function upsertLevelMeta(levelId: string, biome: Biome): void {
+  const db = getDb();
+  const stmt = db.prepare(`
+    INSERT INTO level_meta (level_id, biome)
+    VALUES (?, ?)
+    ON CONFLICT(level_id) DO UPDATE SET biome = excluded.biome
+  `);
+  stmt.run(levelId, biome);
+}
+
+export function getLevelMeta(levelId: string): LevelMetaRecord | null {
+  const db = getDb();
+  const row = db
+    .prepare('SELECT level_id, biome FROM level_meta WHERE level_id = ?')
+    .get(levelId) as LevelMetaRow | undefined;
+  if (!row) {
+    return null;
+  }
+  return { levelId: row.level_id, biome: row.biome as Biome };
 }
 
 export function updateLevel(level: LevelT) {

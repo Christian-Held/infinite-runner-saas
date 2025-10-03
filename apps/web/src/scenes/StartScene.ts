@@ -1,5 +1,7 @@
 import Phaser from 'phaser';
 
+import { getBiome, type BiomeParams } from '@ir/game-spec';
+
 import { fetchApproved, type LevelSummary } from '../level/loader';
 import { loadProgress, type LevelProgress } from '../level/progress';
 import type { GameSceneParams } from './GameScene';
@@ -9,26 +11,51 @@ interface ButtonConfig {
   action: () => void;
 }
 
+function toCss(color: number): string {
+  return `#${color.toString(16).padStart(6, '0')}`;
+}
+
+function mixColor(base: number, target: number, t: number): string {
+  const from = Phaser.Display.Color.IntegerToRGB(base);
+  const to = Phaser.Display.Color.IntegerToRGB(target);
+  const clamped = Phaser.Math.Clamp(t, 0, 1);
+  const r = Math.round(Phaser.Math.Linear(from.r, to.r, clamped));
+  const g = Math.round(Phaser.Math.Linear(from.g, to.g, clamped));
+  const b = Math.round(Phaser.Math.Linear(from.b, to.b, clamped));
+  return toCss(Phaser.Display.Color.GetColor(r, g, b));
+}
+
 export class StartScene extends Phaser.Scene {
   private buttons: Phaser.GameObjects.Text[] = [];
   private continueButton: Phaser.GameObjects.Text | null = null;
   private approvedContainer!: Phaser.GameObjects.Container;
   private approvedEntries: LevelSummary[] = [];
   private progress: LevelProgress | null = null;
+  private startPalette: BiomeParams['palette'] | null = null;
+  private startBiomeName: string = 'meadow';
+  private biomeText!: Phaser.GameObjects.Text;
 
   constructor() {
     super('start');
   }
 
   create(): void {
-    this.cameras.main.setBackgroundColor(0x0f172a);
     this.progress = loadProgress();
+
+    const nextLevelNumber = this.progress?.levelNumber ?? 1;
+    const biomeInfo = getBiome(nextLevelNumber);
+    this.startPalette = biomeInfo.params.palette;
+    this.startBiomeName = biomeInfo.biome;
+    this.cameras.main.setBackgroundColor(this.startPalette.bg);
+
+    const headingColor = mixColor(this.startPalette.accent, 0xffffff, 0.25);
+    const subHeadingColor = mixColor(this.startPalette.platform, 0xffffff, 0.4);
 
     this.add
       .text(this.scale.width / 2, 120, 'Infinite Runner — Season 1', {
         fontSize: '42px',
         fontFamily: 'system-ui, sans-serif',
-        color: '#f8fafc',
+        color: headingColor,
       })
       .setOrigin(0.5);
 
@@ -36,7 +63,15 @@ export class StartScene extends Phaser.Scene {
       .text(this.scale.width / 2, 176, 'Trainiere & veröffentliche deine besten Runs', {
         fontSize: '20px',
         fontFamily: 'system-ui, sans-serif',
-        color: '#cbd5f5',
+        color: subHeadingColor,
+      })
+      .setOrigin(0.5);
+
+    this.biomeText = this.add
+      .text(this.scale.width / 2, 212, `Biome: ${this.startBiomeName}`, {
+        fontSize: '18px',
+        fontFamily: 'system-ui, sans-serif',
+        color: mixColor(this.startPalette.accent, 0xffffff, 0.45),
       })
       .setOrigin(0.5);
 
@@ -78,28 +113,39 @@ export class StartScene extends Phaser.Scene {
   }
 
   private createButton(x: number, y: number, label: string): Phaser.GameObjects.Text {
+    const palette = this.startPalette;
+    const baseColor = palette ? mixColor(palette.accent, 0xffffff, 0.05) : '#38bdf8';
+    const hoverColor = palette ? mixColor(palette.accent, 0xffffff, 0.25) : '#0ea5e9';
+    const textColor = palette ? mixColor(palette.bg, 0x000000, 0.7) : '#0f172a';
+
     const button = this.add
       .text(x, y, label, {
         fontSize: '28px',
         fontFamily: 'system-ui, sans-serif',
-        color: '#0f172a',
-        backgroundColor: '#38bdf8',
+        color: textColor,
+        backgroundColor: baseColor,
         padding: { x: 32, y: 12 },
       })
       .setOrigin(0.5)
       .setInteractive({ useHandCursor: true });
 
+    button.setData('baseColor', baseColor);
+    button.setData('hoverColor', hoverColor);
+    button.setData('textColor', textColor);
     button.on('pointerover', () => {
       if (!button.input?.enabled) {
         return;
       }
-      button.setStyle({ backgroundColor: '#0ea5e9', color: '#f8fafc' });
+      const hover = button.getData('hoverColor') as string | undefined;
+      button.setStyle({ backgroundColor: hover ?? hoverColor, color: '#f8fafc' });
     });
     button.on('pointerout', () => {
       if (!button.input?.enabled) {
         return;
       }
-      button.setStyle({ backgroundColor: '#38bdf8', color: '#0f172a' });
+      const base = button.getData('baseColor') as string | undefined;
+      const text = button.getData('textColor') as string | undefined;
+      button.setStyle({ backgroundColor: base ?? baseColor, color: text ?? textColor });
     });
 
     return button;
@@ -114,10 +160,16 @@ export class StartScene extends Phaser.Scene {
     this.continueButton.input?.setEnable(available);
     this.continueButton.setAlpha(available ? 1 : 0.5);
 
+    const palette = this.startPalette;
+    const disabledBg = palette ? mixColor(palette.platform, 0x000000, 0.45) : '#475569';
+    const disabledText = palette ? mixColor(palette.bg, 0xffffff, 0.6) : '#cbd5f5';
+    const baseColor = (this.continueButton.getData('baseColor') as string | undefined) ?? '#38bdf8';
+    const textColor = (this.continueButton.getData('textColor') as string | undefined) ?? '#0f172a';
+
     if (!available) {
-      this.continueButton.setStyle({ backgroundColor: '#475569', color: '#cbd5f5' });
+      this.continueButton.setStyle({ backgroundColor: disabledBg, color: disabledText });
     } else {
-      this.continueButton.setStyle({ backgroundColor: '#38bdf8', color: '#0f172a' });
+      this.continueButton.setStyle({ backgroundColor: baseColor, color: textColor });
     }
   }
 
@@ -138,8 +190,8 @@ export class StartScene extends Phaser.Scene {
       .text(this.scale.width / 2, this.scale.height - 80, 'Settings coming soon', {
         fontSize: '18px',
         fontFamily: 'system-ui, sans-serif',
-        color: '#f8fafc',
-        backgroundColor: '#334155',
+        color: mixColor(this.startPalette.bg, 0xffffff, 0.85),
+        backgroundColor: mixColor(this.startPalette.platform, 0x000000, 0.45),
         padding: { x: 12, y: 8 },
       })
       .setOrigin(0.5)
@@ -165,7 +217,7 @@ export class StartScene extends Phaser.Scene {
       .text(0, 0, 'Latest Approved', {
         fontSize: '24px',
         fontFamily: 'system-ui, sans-serif',
-        color: '#f8fafc',
+        color: mixColor(this.startPalette.accent, 0xffffff, 0.35),
       })
       .setOrigin(0.5, 0);
 
@@ -186,7 +238,7 @@ export class StartScene extends Phaser.Scene {
       .text(0, 0, 'Latest Approved', {
         fontSize: '24px',
         fontFamily: 'system-ui, sans-serif',
-        color: '#f8fafc',
+        color: mixColor(this.startPalette.accent, 0xffffff, 0.35),
       })
       .setOrigin(0.5, 0);
 
@@ -198,15 +250,19 @@ export class StartScene extends Phaser.Scene {
         .text(0, (index + 1) * spacing + 8, `${entry.title}`, {
           fontSize: '18px',
           fontFamily: 'system-ui, sans-serif',
-          color: '#cbd5f5',
-          backgroundColor: '#1e293b',
+          color: mixColor(this.startPalette.bg, 0xffffff, 0.82),
+          backgroundColor: mixColor(this.startPalette.platform, 0x000000, 0.45),
           padding: { x: 12, y: 6 },
         })
         .setOrigin(0.5, 0)
         .setInteractive({ useHandCursor: true });
 
-      button.on('pointerover', () => button.setStyle({ backgroundColor: '#334155' }));
-      button.on('pointerout', () => button.setStyle({ backgroundColor: '#1e293b' }));
+      button.on('pointerover', () =>
+        button.setStyle({ backgroundColor: mixColor(this.startPalette.accent, 0xffffff, 0.25) }),
+      );
+      button.on('pointerout', () =>
+        button.setStyle({ backgroundColor: mixColor(this.startPalette.platform, 0x000000, 0.45) }),
+      );
       button.on('pointerdown', () => {
         const levelNumber = entry.levelNumber ?? 1;
         this.startGame({

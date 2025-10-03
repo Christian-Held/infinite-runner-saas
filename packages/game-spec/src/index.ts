@@ -27,6 +27,7 @@ const MovingPlatform = z.object({
   to: z.tuple([z.number(), z.number()]),
   period_ms: z.number().int().gt(0),
   phase: z.number().min(0).max(1),
+  open_ms: z.number().int().gt(0).optional(),
 });
 
 const Item = z.object({
@@ -72,3 +73,4 @@ export type AbilityT = z.infer<typeof Ability>;
 export type LevelT = z.infer<typeof Level>;
 
 export * from './progression';
+export * from './biomes';

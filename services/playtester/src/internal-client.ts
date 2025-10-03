@@ -1,4 +1,4 @@
-import { Level, LevelT } from '@ir/game-spec';
+import { Level, LevelT, type Biome } from '@ir/game-spec';
 import { z } from 'zod';
 
 import { InputCmd } from './sim/arcade';
@@ -45,6 +45,22 @@ export async function ingestLevel(payload: IngestLevelPayload): Promise<{ id: st
   }
 
   return response.json() as Promise<{ id: string }>;
+}
+
+export async function submitLevelMeta(params: { levelId: string; biome: Biome }): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/internal/levels/meta`, {
+    method: 'POST',
+    headers: INTERNAL_HEADERS,
+    body: JSON.stringify({
+      level_id: params.levelId,
+      biome: params.biome,
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to submit level meta: ${response.status} ${text}`);
+  }
 }
 
 export async function createJobRecord(params: {

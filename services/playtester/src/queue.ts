@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { Ability } from '@ir/game-spec';
+import { Ability, getBiome } from '@ir/game-spec';
 import { Queue, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { z } from 'zod';
@@ -9,6 +9,7 @@ import { closeGenerator, generateLevel } from './generator';
 import {
   fetchLevel,
   ingestLevel,
+  submitLevelMeta,
   createJobRecord,
   updateJobStatus,
   submitLevelPath,
@@ -94,6 +95,9 @@ export async function startWorkers(): Promise<WorkerRuntime> {
         );
 
         await ingestLevel({ level, difficulty, seed: level.seed });
+        const levelNumberForMeta = job.data.levelNumber ?? 1;
+        const { biome: biomeName } = getBiome(levelNumberForMeta);
+        await submitLevelMeta({ levelId: level.id, biome: biomeName });
 
         await updateJobStatus({ id: jobId, status: 'succeeded', levelId: level.id });
 
