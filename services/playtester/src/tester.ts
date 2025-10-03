@@ -1,5 +1,7 @@
 import { LevelT, getLevelPlan } from '@ir/game-spec';
 
+import type { Logger } from '@ir/logger';
+
 import { InputCmd, InputState, createSpawn, maxJumpGapPX, simulate } from './sim/arcade';
 import { findPath } from './sim/search';
 
@@ -364,15 +366,17 @@ function findHazardNear(level: LevelT, point?: { x: number; y: number }) {
   return null;
 }
 
-export async function testLevel(level: LevelT): Promise<TestLevelResult> {
+export async function testLevel(level: LevelT, logger: Logger): Promise<TestLevelResult> {
   const precheck = runPrechecks(level);
   if (!precheck.ok) {
+    logger.warn({ reason: precheck.fail.reason, at: precheck.fail.at }, 'Precheck failed');
     return { ok: false, fail: precheck.fail, reason: precheck.fail.reason };
   }
 
   const search = findPath(level, 3000, 80000);
   if (!search.ok || !search.path) {
     const fail = mapSearchFail(level, search.reason);
+    logger.warn({ reason: fail.reason, nodes: search.nodes, durationMs: search.ms }, 'Pathfinding failed');
     return {
       ok: false,
       fail,
@@ -394,6 +398,10 @@ export async function testLevel(level: LevelT): Promise<TestLevelResult> {
         at: failPoint,
         details: hazard ? { hazard } : undefined,
       };
+      logger.warn(
+        { reason: fail.reason, at: failPoint, nodes: search.nodes, durationMs: search.ms },
+        'Simulation hazard failure',
+      );
       return {
         ok: false,
         fail,
@@ -404,6 +412,10 @@ export async function testLevel(level: LevelT): Promise<TestLevelResult> {
     }
 
     const fail = mapSearchFail(level, simulation.reason === 'timeout' ? 'timeout' : 'no_path');
+    logger.warn(
+      { reason: fail.reason, nodes: search.nodes, durationMs: search.ms },
+      'Simulation failure',
+    );
     return {
       ok: false,
       fail,
@@ -413,6 +425,7 @@ export async function testLevel(level: LevelT): Promise<TestLevelResult> {
     };
   }
 
+  logger.info({ nodes: search.nodes, durationMs: search.ms }, 'Test level succeeded');
   return {
     ok: true,
     path: simulation.path.length > 0 ? simulation.path : path,

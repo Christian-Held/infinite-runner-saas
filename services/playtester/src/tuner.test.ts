@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 
 import { LevelT } from '@ir/game-spec';
 
+import { createLogger } from '@ir/logger';
+
 import { tune } from './tuner';
 
 type PartialLevel = Partial<Omit<LevelT, 'rules'>> & {
@@ -35,6 +37,8 @@ function buildFail(details: Record<string, unknown>): Parameters<typeof tune>[1]
   } as const;
 }
 
+const logger = createLogger('tuner-test');
+
 function testAdjustsExistingWindow() {
   const level = createLevel({
     moving: [
@@ -50,7 +54,7 @@ function testAdjustsExistingWindow() {
   });
 
   const fail = buildFail({ movingIndex: 0, minOpeningMs: 180, periodRange: [800, 1600] });
-  const result = tune(level, fail);
+  const result = tune(level, fail, logger);
 
   assert.ok(result, 'expected tune() to patch level');
   assert.equal(result?.patch.op, 'widen_hazard_window');
@@ -74,7 +78,7 @@ function testInitialisesMissingWindow() {
   });
 
   const fail = buildFail({ movingIndex: 0, minOpeningMs: 260 });
-  const result = tune(level, fail);
+  const result = tune(level, fail, logger);
 
   assert.ok(result, 'expected tune() to patch level');
   const moving = result?.patched.moving?.[0];
