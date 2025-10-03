@@ -1,14 +1,46 @@
 import Phaser from 'phaser';
 
-import { LevelT } from '@ir/game-spec';
+import {
+  LevelT,
+  getBiome,
+  getBiomeByName,
+  type Biome,
+  type BiomeParams,
+} from '@ir/game-spec';
 
+import { playGhost, type GhostPlayback } from '../game/Ghost';
+import {
+  fetchApproved,
+  fetchLevel,
+  fetchLevelMeta,
+  fetchLevelPath,
+  fetchSeasonLevels,
+  type InputCmd,
+  type LevelSummary,
+  type SeasonLevelEntry,
+  type LevelMeta,
+} from '../level/loader';
+import { clearProgress, saveProgress } from '../level/progress';
 import { RUNNER_CONSTANTS } from '../types/game';
-import { fetchLevel, fetchSeasonLevels, type SeasonLevelEntry } from '../level/loader';
 
 const DEFAULT_WORLD_HEIGHT = 720;
 const EXIT_WIDTH = 40;
 const EXIT_HEIGHT = 80;
 const PLAYER_START_OFFSET_Y = 140;
+
+function toCss(color: number): string {
+  return `#${color.toString(16).padStart(6, '0')}`;
+}
+
+function mixColor(base: number, target: number, t: number): number {
+  const from = Phaser.Display.Color.IntegerToRGB(base);
+  const to = Phaser.Display.Color.IntegerToRGB(target);
+  const clamped = Phaser.Math.Clamp(t, 0, 1);
+  const r = Math.round(Phaser.Math.Linear(from.r, to.r, clamped));
+  const g = Math.round(Phaser.Math.Linear(from.g, to.g, clamped));
+  const b = Math.round(Phaser.Math.Linear(from.b, to.b, clamped));
+  return Phaser.Display.Color.GetColor(r, g, b);
+}
 
 type StaticSprite = Phaser.Physics.Arcade.Sprite & {
   body: Phaser.Physics.Arcade.StaticBody;
@@ -18,29 +50,64 @@ type DynamicSprite = Phaser.Physics.Arcade.Sprite & {
   body: Phaser.Physics.Arcade.Body;
 };
 
-export class GameScene extends Phaser.Scene {
-  private levelData!: LevelT;
-  private worldWidth = 0;
-  private worldHeight = DEFAULT_WORLD_HEIGHT;
+interface LevelTarget {
+  levelNumber: number;
+  levelId: string;
+  title: string;
+}
 
+export interface GameSceneParams {
+  levelNumber?: number;
+  levelId?: string | null;
+  seasonId?: string;
+}
+
+export class GameScene extends Phaser.Scene {
   private seasonId = 'season-1';
   private totalLevels = 100;
   private currentLevelNumber = 1;
   private currentLevelId: string | null = null;
-  private cachedSeasonLevels: SeasonLevelEntry[] = [];
+  private currentLevelTitle = '';
+
+  private levelData!: LevelT;
+  private worldWidth = 0;
+  private worldHeight = DEFAULT_WORLD_HEIGHT;
+  private biomeTheme: { name: Biome; params: BiomeParams } | null = null;
+  private palette: BiomeParams['palette'] | null = null;
+  private backgroundLayers: Phaser.GameObjects.Rectangle[] = [];
+
+  private seasonEntries: SeasonLevelEntry[] = [];
+  private approvedLevels: LevelSummary[] = [];
+  private preloadedLevels = new Map<string, LevelT>();
+  private pendingNextLevel: LevelTarget | null = null;
 
   private player!: DynamicSprite;
   private platforms!: Phaser.Physics.Arcade.StaticGroup;
   private hazards!: Phaser.Physics.Arcade.StaticGroup;
   private exitZone!: StaticSprite;
 
-  private hudText!: Phaser.GameObjects.Text;
-  private pauseOverlay!: Phaser.GameObjects.Text;
+  private platformCollider: Phaser.Physics.Arcade.Collider | null = null;
+  private hazardOverlap: Phaser.Physics.Arcade.Collider | null = null;
+  private exitOverlap: Phaser.Physics.Arcade.Collider | null = null;
+
+  private ghostPlayback: GhostPlayback | null = null;
+  private ghostCollider: Phaser.Physics.Arcade.Collider | null = null;
+
+  private hudLevelText!: Phaser.GameObjects.Text;
+  private hudTimerText!: Phaser.GameObjects.Text;
+  private hudAbilitiesText!: Phaser.GameObjects.Text;
+  private hudBiomeText!: Phaser.GameObjects.Text;
+  private hudRetryText!: Phaser.GameObjects.Text;
+  private loadingText!: Phaser.GameObjects.Text;
+  private pauseOverlay!: Phaser.GameObjects.Container;
+  private pauseBackground!: Phaser.GameObjects.Rectangle;
+  private pauseButtons: Phaser.GameObjects.Text[] = [];
 
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
   private keyA!: Phaser.Input.Keyboard.Key;
   private keyD!: Phaser.Input.Keyboard.Key;
   private spaceKey!: Phaser.Input.Keyboard.Key;
+  private keyR!: Phaser.Input.Keyboard.Key;
   private pauseKey!: Phaser.Input.Keyboard.Key;
   private jumpKeys: Phaser.Input.Keyboard.Key[] = [];
 
@@ -57,36 +124,42 @@ export class GameScene extends Phaser.Scene {
     super('game');
   }
 
-  create(): void {
-    this.isLevelReady = false;
-    void this.initializeLevel();
+  init(data: GameSceneParams): void {
+    if (typeof data.seasonId === 'string' && data.seasonId.length > 0) {
+      this.seasonId = data.seasonId;
+    }
+
+    if (typeof data.levelNumber === 'number' && Number.isFinite(data.levelNumber)) {
+      this.currentLevelNumber = Math.max(1, Math.round(data.levelNumber));
+    }
+
+    if (typeof data.levelId === 'string') {
+      this.currentLevelId = data.levelId;
+    } else if (data.levelId === null) {
+      this.currentLevelId = null;
+    }
   }
 
-  private async initializeLevel(): Promise<void> {
-    try {
-      const level = await this.loadLevelFor(this.currentLevelNumber);
-      this.levelData = level;
-      this.currentLevelId = level.id;
+  create(): void {
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, this.dispose, this);
+    this.events.once(Phaser.Scenes.Events.DESTROY, this.dispose, this);
 
-      this.setupInput();
-      this.setupLevel();
-      this.setupPlayer();
-      this.setupCamera();
-      this.setupHud();
+    this.setupInput();
+    this.createHud();
+    this.createPauseMenu();
 
-      this.levelStartTime = this.time.now;
-      this.pauseStartedAt = 0;
-      this.accumulatedPauseTime = 0;
-      this.isPaused = false;
-      this.isLevelReady = true;
-    } catch (error) {
-      console.error('Level konnte nicht geladen werden:', error);
-      this.isLevelReady = false;
-    }
+    this.physics.world.setBoundsCollision(true, true, true, false);
+
+    void this.initializeLevel();
   }
 
   update(time: number): void {
     if (!this.isLevelReady) {
+      return;
+    }
+
+    if (Phaser.Input.Keyboard.JustDown(this.keyR)) {
+      this.restartLevel();
       return;
     }
 
@@ -101,11 +174,317 @@ export class GameScene extends Phaser.Scene {
     this.checkFailState();
   }
 
+  private async initializeLevel(): Promise<void> {
+    this.isLevelReady = false;
+    this.showLoadingState(true);
+    this.disposeLevelObjects();
+
+    try {
+      const target = await this.resolveCurrentLevelTarget();
+      this.currentLevelNumber = target.levelNumber;
+      const level = await this.obtainLevel(target.levelId);
+      this.levelData = level;
+      this.currentLevelId = target.levelId;
+      this.currentLevelTitle = target.title;
+
+      const meta = await fetchLevelMeta(level.id);
+      const theme = this.resolveBiomeTheme(target.levelNumber, meta);
+      this.applyBiomeTheme(theme);
+
+      this.setupLevel();
+      this.setupPlayer();
+      this.setupCamera();
+
+      this.levelStartTime = this.time.now;
+      this.pauseStartedAt = 0;
+      this.accumulatedPauseTime = 0;
+      this.isPaused = false;
+      this.isLevelReady = true;
+
+      const ghostPromise = fetchLevelPath(level.id);
+      void this.prefetchNextLevel(target.levelNumber);
+
+      const path = await ghostPromise;
+      this.startGhost(path);
+    } catch (error) {
+      console.error('Level konnte nicht geladen werden:', error);
+      this.isLevelReady = false;
+    } finally {
+      this.showLoadingState(false);
+    }
+  }
+
+  private dispose(): void {
+    this.disposeLevelObjects();
+    this.preloadedLevels.clear();
+  }
+
+  private disposeLevelObjects(): void {
+    this.stopGhost();
+
+    if (this.platformCollider) {
+      this.platformCollider.destroy();
+      this.platformCollider = null;
+    }
+
+    if (this.hazardOverlap) {
+      this.hazardOverlap.destroy();
+      this.hazardOverlap = null;
+    }
+
+    if (this.exitOverlap) {
+      this.exitOverlap.destroy();
+      this.exitOverlap = null;
+    }
+
+    if (this.ghostCollider) {
+      this.ghostCollider.destroy();
+      this.ghostCollider = null;
+    }
+
+    if (this.player) {
+      this.player.destroy();
+    }
+
+    if (this.platforms) {
+      this.platforms.clear(true, true);
+      this.platforms.destroy(true);
+    }
+
+    if (this.hazards) {
+      this.hazards.clear(true, true);
+      this.hazards.destroy(true);
+    }
+
+    if (this.exitZone) {
+      this.exitZone.destroy();
+    }
+
+    this.backgroundLayers.forEach((layer) => layer.destroy());
+    this.backgroundLayers = [];
+    this.palette = null;
+    this.biomeTheme = null;
+    this.refreshHudPalette();
+    this.tintPauseMenu();
+  }
+
+  private async resolveCurrentLevelTarget(): Promise<LevelTarget> {
+    await this.ensureCatalogs();
+    const desiredNumber = Math.max(1, this.currentLevelNumber);
+
+    if (this.currentLevelId) {
+      const title = this.findTitleForLevel(this.currentLevelId) ?? `Level ${desiredNumber}`;
+      return { levelNumber: desiredNumber, levelId: this.currentLevelId, title };
+    }
+
+    const candidate = await this.resolveLevelTargetForNumber(desiredNumber);
+    if (candidate) {
+      return candidate;
+    }
+
+    return {
+      levelNumber: desiredNumber,
+      levelId: 'demo-01',
+      title: 'Demo Level',
+    };
+  }
+
+  private async resolveLevelTargetForNumber(levelNumber: number): Promise<LevelTarget | null> {
+    await this.ensureCatalogs();
+
+    const seasonCandidate = this.seasonEntries.find(
+      (entry) => entry.levelNumber === levelNumber && typeof entry.levelId === 'string',
+    );
+    if (seasonCandidate?.levelId) {
+      return {
+        levelNumber,
+        levelId: seasonCandidate.levelId,
+        title: `Level ${seasonCandidate.levelNumber}`,
+      };
+    }
+
+    const approvedCandidate = this.approvedLevels[levelNumber - 1] ?? this.approvedLevels[0];
+    if (approvedCandidate) {
+      return {
+        levelNumber,
+        levelId: approvedCandidate.id,
+        title: approvedCandidate.title,
+      };
+    }
+
+    return null;
+  }
+
+  private async ensureCatalogs(): Promise<void> {
+    if (this.seasonEntries.length === 0) {
+      const published = await fetchSeasonLevels(this.seasonId, { published: true });
+      if (published.length > 0) {
+        this.seasonEntries = published;
+      }
+    }
+
+    if (this.approvedLevels.length === 0) {
+      const approved = await fetchApproved({ limit: 100, offset: 0 });
+      this.approvedLevels = approved;
+    }
+  }
+
+  private findTitleForLevel(levelId: string): string | null {
+    const approved = this.approvedLevels.find((entry) => entry.id === levelId);
+    if (approved) {
+      return approved.title;
+    }
+    return null;
+  }
+
+  private async obtainLevel(levelId: string): Promise<LevelT> {
+    const cached = this.preloadedLevels.get(levelId);
+    if (cached) {
+      return cached;
+    }
+
+    const level = await fetchLevel(levelId);
+    this.preloadedLevels.set(levelId, level);
+    this.preloadedLevels.set(level.id, level);
+    return level;
+  }
+
+  private async prefetchNextLevel(currentNumber: number): Promise<void> {
+    const nextNumber = currentNumber + 1;
+    const candidate = await this.resolveLevelTargetForNumber(nextNumber);
+    if (!candidate) {
+      this.pendingNextLevel = null;
+      return;
+    }
+
+    this.pendingNextLevel = candidate;
+    if (this.preloadedLevels.has(candidate.levelId)) {
+      return;
+    }
+
+    try {
+      const level = await fetchLevel(candidate.levelId);
+      this.preloadedLevels.set(candidate.levelId, level);
+      this.preloadedLevels.set(level.id, level);
+    } catch (error) {
+      console.warn('Konnte nächstes Level nicht vorladen.', error);
+    }
+  }
+
+  private resolveBiomeTheme(levelNumber: number, meta: LevelMeta | null): {
+    name: Biome;
+    params: BiomeParams;
+  } {
+    if (meta && meta.biome) {
+      return getBiomeByName(meta.biome);
+    }
+    return getBiome(levelNumber);
+  }
+
+  private applyBiomeTheme(theme: { name: Biome; params: BiomeParams }): void {
+    this.biomeTheme = theme;
+    this.palette = theme.params.palette;
+    this.refreshHudPalette();
+    this.tintPauseMenu();
+    this.rebuildBackground();
+  }
+
+  private paletteColor(key: keyof BiomeParams['palette'], fallback: number): number {
+    return this.palette ? this.palette[key] : fallback;
+  }
+
+  private refreshHudPalette(): void {
+    if (!this.hudLevelText || !this.hudTimerText || !this.hudAbilitiesText || !this.hudRetryText || !this.hudBiomeText) {
+      return;
+    }
+
+    if (!this.palette) {
+      this.hudLevelText.setColor('#f8fafc');
+      this.hudTimerText.setColor('#f8fafc');
+      this.hudAbilitiesText.setColor('#e2e8f0');
+      this.hudRetryText.setColor('#94a3b8');
+      this.hudBiomeText.setColor('#cbd5f5');
+      return;
+    }
+
+    const palette = this.palette;
+    const titleColor = toCss(mixColor(palette.accent, 0xffffff, 0.25));
+    const timerColor = toCss(mixColor(palette.hazard, 0xffffff, 0.35));
+    const infoColor = toCss(mixColor(palette.platform, 0xffffff, 0.4));
+    const retryColor = toCss(mixColor(palette.bg, 0x000000, 0.6));
+
+    this.hudLevelText.setColor(titleColor);
+    this.hudTimerText.setColor(timerColor);
+    this.hudAbilitiesText.setColor(infoColor);
+    this.hudRetryText.setColor(retryColor);
+    this.hudBiomeText.setColor(titleColor);
+  }
+
+  private tintPauseMenu(): void {
+    if (!this.pauseBackground) {
+      return;
+    }
+
+    if (!this.palette) {
+      this.pauseBackground.setFillStyle(0x020617, 0.85);
+      this.pauseButtons.forEach((button) => {
+        button.setData('baseColor', '#1e293b');
+        button.setData('hoverColor', '#334155');
+        button.setStyle({ backgroundColor: '#1e293b' });
+      });
+      return;
+    }
+
+    const palette = this.palette;
+    const overlayColor = mixColor(palette.bg, 0x000000, 0.55);
+    this.pauseBackground.setFillStyle(overlayColor, 0.85);
+    const base = toCss(mixColor(palette.platform, 0x000000, 0.35));
+    const hover = toCss(mixColor(palette.accent, 0xffffff, 0.2));
+    this.pauseButtons.forEach((button) => {
+      button.setData('baseColor', base);
+      button.setData('hoverColor', hover);
+      button.setStyle({ backgroundColor: base, color: '#f8fafc' });
+    });
+  }
+
+  private rebuildBackground(): void {
+    this.backgroundLayers.forEach((layer) => layer.destroy());
+    this.backgroundLayers = [];
+
+    const camera = this.cameras.main;
+    if (!this.palette) {
+      camera.setBackgroundColor(0x0f172a);
+      return;
+    }
+
+    const palette = this.palette;
+    camera.setBackgroundColor(palette.bg);
+    const width = Math.max(this.worldWidth, this.scale.width * 2);
+    const height = Math.max(this.worldHeight, DEFAULT_WORLD_HEIGHT);
+
+    const layers = [
+      { color: mixColor(palette.bg, 0xffffff, 0.08), alpha: 0.45, scroll: 0.1, depth: -40, heightScale: 1.4 },
+      { color: mixColor(palette.platform, palette.bg, 0.3), alpha: 0.32, scroll: 0.22, depth: -30, heightScale: 1.25 },
+      { color: mixColor(palette.hazard, palette.bg, 0.55), alpha: 0.24, scroll: 0.38, depth: -20, heightScale: 1.15 },
+      { color: mixColor(palette.accent, 0xffffff, 0.12), alpha: 0.2, scroll: 0.52, depth: -15, heightScale: 1.05 },
+    ];
+
+    layers.forEach((layer, index) => {
+      const rect = this.add
+        .rectangle(0, 0, width * 1.05, height * layer.heightScale, layer.color, layer.alpha)
+        .setOrigin(0, 0)
+        .setScrollFactor(layer.scroll, layer.scroll * 0.6 + 0.2)
+        .setDepth(layer.depth - index);
+      this.backgroundLayers.push(rect);
+    });
+  }
+
   private setupInput(): void {
     this.cursors = this.input.keyboard.createCursorKeys();
     this.keyA = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.A);
     this.keyD = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.D);
     this.spaceKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
+    this.keyR = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.R);
     this.pauseKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.ESC);
 
     const maybeKeys: Array<Phaser.Input.Keyboard.Key | undefined> = [
@@ -122,7 +501,7 @@ export class GameScene extends Phaser.Scene {
     this.worldHeight = height;
 
     this.physics.world.setBounds(0, 0, width, height);
-    this.physics.world.setBoundsCollision(true, true, true, false);
+    this.rebuildBackground();
 
     this.platforms = this.physics.add.staticGroup();
     this.hazards = this.physics.add.staticGroup();
@@ -144,6 +523,7 @@ export class GameScene extends Phaser.Scene {
       'exit',
     );
     exitSprite.setDisplaySize(EXIT_WIDTH, EXIT_HEIGHT).refreshBody();
+    exitSprite.setTint(this.paletteColor('accent', 0x22c55e));
     this.exitZone = exitSprite as StaticSprite;
   }
 
@@ -160,6 +540,7 @@ export class GameScene extends Phaser.Scene {
       RUNNER_CONSTANTS.moveSpeed,
       Math.abs(RUNNER_CONSTANTS.jumpVelocity) * 1.5,
     );
+    player.setTint(this.paletteColor('accent', 0x38bdf8));
 
     const body = player.body as Phaser.Physics.Arcade.Body;
     body.setSize(player.width * 0.6, player.height);
@@ -167,9 +548,15 @@ export class GameScene extends Phaser.Scene {
 
     this.player = player as DynamicSprite;
 
-    this.physics.add.collider(this.player, this.platforms);
-    this.physics.add.overlap(this.player, this.hazards, () => this.restartLevel(), undefined, this);
-    this.physics.add.overlap(
+    this.platformCollider = this.physics.add.collider(this.player, this.platforms);
+    this.hazardOverlap = this.physics.add.overlap(
+      this.player,
+      this.hazards,
+      () => this.restartLevel(),
+      undefined,
+      this,
+    );
+    this.exitOverlap = this.physics.add.overlap(
       this.player,
       this.exitZone,
       () => this.completeLevel(),
@@ -181,58 +568,37 @@ export class GameScene extends Phaser.Scene {
   private setupCamera(): void {
     const camera = this.cameras.main;
     camera.setBounds(0, 0, this.worldWidth, this.worldHeight);
-    camera.setBackgroundColor(0x0f172a);
+    camera.setBackgroundColor(this.paletteColor('bg', 0x0f172a));
     camera.startFollow(this.player, true, 0.12, 0.12);
     camera.setDeadzone(200, 120);
     camera.setRoundPixels(true);
   }
 
-  private async loadLevelFor(levelNumber: number): Promise<LevelT> {
-    const entry = await this.findSeasonEntry(levelNumber);
-    if (entry?.levelId) {
-      return fetchLevel(entry.levelId);
-    }
-    return fetchLevel('demo');
-  }
-
-  private async findSeasonEntry(levelNumber: number): Promise<SeasonLevelEntry | null> {
-    const unpublished = await fetchSeasonLevels(this.seasonId, { published: false });
-    this.cachedSeasonLevels = unpublished;
-    const direct = unpublished.find(
-      (candidate) => candidate.levelNumber === levelNumber && typeof candidate.levelId === 'string',
-    );
-    if (direct) {
-      return direct;
+  private startGhost(path: InputCmd[] | null): void {
+    this.stopGhost();
+    if (!path || path.length === 0) {
+      return;
     }
 
-    const published = await fetchSeasonLevels(this.seasonId, { published: true });
-    this.cachedSeasonLevels = published;
-    const fallback = published.find(
-      (candidate) => candidate.levelNumber === levelNumber && typeof candidate.levelId === 'string',
-    );
-    return fallback ?? null;
+    const playback = playGhost(this, this.player, path);
+    if (!playback) {
+      return;
+    }
+
+    this.ghostPlayback = playback;
+    this.ghostCollider = this.physics.add.collider(playback.sprite, this.platforms);
   }
 
-  private setupHud(): void {
-    this.hudText = this.add
-      .text(16, 16, '', {
-        fontSize: '20px',
-        fontFamily: 'system-ui, sans-serif',
-        color: '#f8fafc',
-      })
-      .setScrollFactor(0)
-      .setDepth(100);
+  private stopGhost(): void {
+    if (this.ghostCollider) {
+      this.ghostCollider.destroy();
+      this.ghostCollider = null;
+    }
 
-    this.pauseOverlay = this.add
-      .text(this.scale.width / 2, this.scale.height / 2, 'PAUSE', {
-        fontSize: '48px',
-        fontFamily: 'system-ui, sans-serif',
-        color: '#f8fafc',
-      })
-      .setOrigin(0.5)
-      .setScrollFactor(0)
-      .setDepth(200)
-      .setVisible(false);
+    if (this.ghostPlayback) {
+      this.ghostPlayback.stop();
+      this.ghostPlayback = null;
+    }
   }
 
   private processMovement(time: number): void {
@@ -287,46 +653,217 @@ export class GameScene extends Phaser.Scene {
   }
 
   private restartLevel(): void {
+    if (!this.scene.isActive()) {
+      return;
+    }
+
     this.isLevelReady = false;
-    this.cachedSeasonLevels = [];
-    this.scene.restart();
+    this.pendingNextLevel = null;
+    this.scene.restart({
+      seasonId: this.seasonId,
+      levelNumber: this.currentLevelNumber,
+      levelId: this.currentLevelId,
+    });
   }
 
   private completeLevel(): void {
     const elapsed = this.getElapsedSeconds(this.time.now);
     console.info(`Level geschafft in ${elapsed.toFixed(2)}s`);
     this.isLevelReady = false;
-    if (this.currentLevelNumber < this.totalLevels) {
-      this.currentLevelNumber += 1;
+
+    const next = this.pendingNextLevel;
+    if (next) {
+      saveProgress({ levelNumber: next.levelNumber, levelId: next.levelId });
+      this.scene.launch('transition', {
+        from: 'game',
+        target: 'game',
+        payload: {
+          seasonId: this.seasonId,
+          levelNumber: next.levelNumber,
+          levelId: next.levelId,
+        } satisfies GameSceneParams,
+      });
+    } else {
+      clearProgress();
+      this.scene.launch('transition', {
+        from: 'game',
+        target: 'start',
+      });
     }
-    this.currentLevelId = null;
-    this.cachedSeasonLevels = [];
-    this.scene.restart();
   }
 
   private handlePauseToggle(time: number): void {
-    if (Phaser.Input.Keyboard.JustDown(this.pauseKey)) {
-      this.isPaused = !this.isPaused;
-
-      if (this.isPaused) {
-        this.pauseStartedAt = time;
-        this.physics.world.pause();
-      } else {
-        this.accumulatedPauseTime += time - this.pauseStartedAt;
-        this.physics.world.resume();
-      }
-
-      this.pauseOverlay.setVisible(this.isPaused);
+    if (!Phaser.Input.Keyboard.JustDown(this.pauseKey)) {
+      return;
     }
+
+    this.isPaused = !this.isPaused;
+
+    if (this.isPaused) {
+      this.pauseStartedAt = time;
+      this.physics.world.pause();
+      this.pauseOverlay.setVisible(true);
+    } else {
+      this.accumulatedPauseTime += time - this.pauseStartedAt;
+      this.physics.world.resume();
+      this.pauseOverlay.setVisible(false);
+    }
+  }
+
+  private resumeGame(): void {
+    if (!this.isPaused) {
+      return;
+    }
+
+    this.isPaused = false;
+    this.physics.world.resume();
+    this.accumulatedPauseTime += this.time.now - this.pauseStartedAt;
+    this.pauseOverlay.setVisible(false);
+  }
+
+  private quitToMenu(): void {
+    this.isLevelReady = false;
+    this.physics.world.resume();
+    this.pauseOverlay.setVisible(false);
+    this.scene.launch('transition', {
+      from: 'game',
+      target: 'start',
+    });
+  }
+
+  private createHud(): void {
+    this.hudLevelText = this.add
+      .text(16, 16, '', {
+        fontSize: '18px',
+        fontFamily: 'system-ui, sans-serif',
+        color: '#f8fafc',
+      })
+      .setScrollFactor(0)
+      .setDepth(100);
+
+    this.hudTimerText = this.add
+      .text(this.scale.width - 16, 16, '', {
+        fontSize: '18px',
+        fontFamily: 'system-ui, sans-serif',
+        color: '#f8fafc',
+      })
+      .setOrigin(1, 0)
+      .setScrollFactor(0)
+      .setDepth(100);
+
+    this.hudAbilitiesText = this.add
+      .text(16, 48, '', {
+        fontSize: '16px',
+        fontFamily: 'system-ui, sans-serif',
+        color: '#e2e8f0',
+      })
+      .setScrollFactor(0)
+      .setDepth(100);
+
+    this.hudBiomeText = this.add
+      .text(this.scale.width - 16, 48, '', {
+        fontSize: '16px',
+        fontFamily: 'system-ui, sans-serif',
+        color: '#cbd5f5',
+      })
+      .setOrigin(1, 0)
+      .setScrollFactor(0)
+      .setDepth(100);
+
+    this.hudRetryText = this.add
+      .text(16, this.scale.height - 32, '[R] Neustart  ·  [Esc] Pause', {
+        fontSize: '16px',
+        fontFamily: 'system-ui, sans-serif',
+        color: '#94a3b8',
+      })
+      .setScrollFactor(0)
+      .setDepth(100);
+
+    this.loadingText = this.add
+      .text(this.scale.width / 2, this.scale.height / 2, 'Lade Level …', {
+        fontSize: '24px',
+        fontFamily: 'system-ui, sans-serif',
+        color: '#f8fafc',
+      })
+      .setOrigin(0.5)
+      .setScrollFactor(0)
+      .setDepth(300)
+      .setVisible(false);
+
+    this.refreshHudPalette();
+  }
+
+  private createPauseMenu(): void {
+    const width = this.scale.width;
+    const height = this.scale.height;
+
+    const background = this.add
+      .rectangle(0, 0, width, height, 0x020617, 0.85)
+      .setOrigin(0.5);
+
+    const resumeButton = this.createPauseButton('Resume', -40, () => this.resumeGame());
+    const retryButton = this.createPauseButton('Retry', 20, () => this.restartLevel());
+    const quitButton = this.createPauseButton('Quit', 80, () => this.quitToMenu());
+
+    this.pauseBackground = background;
+    this.pauseButtons = [resumeButton, retryButton, quitButton];
+
+    this.pauseOverlay = this.add
+      .container(width / 2, height / 2, [background, resumeButton, retryButton, quitButton])
+      .setDepth(400)
+      .setScrollFactor(0)
+      .setVisible(false);
+
+    this.tintPauseMenu();
+  }
+
+  private createPauseButton(
+    label: string,
+    offsetY: number,
+    onClick: () => void,
+  ): Phaser.GameObjects.Text {
+    const button = this.add
+      .text(0, offsetY, label, {
+        fontSize: '24px',
+        fontFamily: 'system-ui, sans-serif',
+        color: '#f8fafc',
+        backgroundColor: '#1e293b',
+        padding: { x: 16, y: 8 },
+      })
+      .setOrigin(0.5)
+      .setInteractive({ useHandCursor: true });
+
+    button.on('pointerdown', onClick);
+    button.setData('baseColor', '#1e293b');
+    button.setData('hoverColor', '#334155');
+    button.on('pointerover', () => {
+      const hover = button.getData('hoverColor') as string | undefined;
+      button.setStyle({ backgroundColor: hover ?? '#334155' });
+    });
+    button.on('pointerout', () => {
+      const base = button.getData('baseColor') as string | undefined;
+      button.setStyle({ backgroundColor: base ?? '#1e293b' });
+    });
+
+    return button;
   }
 
   private updateHud(time: number): void {
     const elapsed = this.getElapsedSeconds(time);
-    const abilities = this.formatAbilities();
-    const levelLabel = this.currentLevelId ?? this.levelData.id;
-    this.hudText.setText(
-      `Level ${this.currentLevelNumber} / ${this.totalLevels}\nID: ${levelLabel}\nAbilities: ${abilities}\nTime: ${elapsed.toFixed(2)}s`,
+    this.hudLevelText.setText(
+      `${this.formatSeasonLabel()}\n${this.currentLevelTitle}`,
     );
+    this.hudTimerText.setText(`Zeit: ${elapsed.toFixed(2)}s`);
+    this.hudAbilitiesText.setText(`Abilities: ${this.formatAbilities()}`);
+    this.hudBiomeText.setText(`Biome: ${this.biomeTheme?.name ?? 'n/a'}`);
+  }
+
+  private formatSeasonLabel(): string {
+    return `${this.seasonId.replace(/-/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase())} — Level ${this.currentLevelNumber}/${this.totalLevels}`;
+  }
+
+  private showLoadingState(isLoading: boolean): void {
+    this.loadingText.setVisible(isLoading);
   }
 
   private getElapsedSeconds(time: number): number {
@@ -367,6 +904,13 @@ export class GameScene extends Phaser.Scene {
     const sprite = group.create(tile.x + tile.w / 2, tile.y + tile.h / 2, texture) as StaticSprite;
     sprite.setDisplaySize(tile.w, tile.h);
     sprite.refreshBody();
+    if (this.palette) {
+      if (tile.type === 'hazard') {
+        sprite.setTint(this.palette.hazard);
+      } else {
+        sprite.setTint(this.palette.platform);
+      }
+    }
   }
 
   private formatAbilities(): string {

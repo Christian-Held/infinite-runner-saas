@@ -1,0 +1,53 @@
+{
+  auto_https off
+}
+
+:80 {
+  encode gzip
+
+  @apiLevels {
+    path /levels*
+  }
+  handle @apiLevels {
+    reverse_proxy api:3000
+  }
+
+  @apiJobs {
+    path /jobs*
+  }
+  handle @apiJobs {
+    reverse_proxy api:3000
+  }
+
+  @apiSeasons {
+    path /seasons*
+  }
+  handle @apiSeasons {
+    reverse_proxy api:3000
+  }
+
+  @apiInternal {
+    path /internal*
+  }
+  handle @apiInternal {
+    reverse_proxy api:3000
+  }
+
+  @apiHealth {
+    path /health
+  }
+  handle @apiHealth {
+    reverse_proxy api:3000
+  }
+
+  @apiMetrics {
+    path /metrics
+  }
+  handle @apiMetrics {
+    reverse_proxy api:3000
+  }
+
+  handle {
+    reverse_proxy web:8080
+  }
+}

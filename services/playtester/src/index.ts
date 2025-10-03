@@ -1,10 +1,15 @@
 import 'dotenv/config';
 
+import { startMetricsServer } from './metrics-server';
 import { startWorkers } from './queue';
 
 async function bootstrap() {
   const runtime = await startWorkers();
   console.log('[playtester] Workers for gen/test queues started');
+
+  const metricsPort = Number.parseInt(process.env.METRICS_PORT ?? '9100', 10);
+  const metricsServer = await startMetricsServer(metricsPort);
+  console.log(`[playtester] Metrics server listening on :${metricsPort}`);
 
   if (!process.env.OPENAI_API_KEY) {
     console.error(
@@ -15,6 +20,9 @@ async function bootstrap() {
       .catch((error) =>
         console.error('[playtester] Failed to close runtime after missing API key', error),
       );
+    await metricsServer
+      .close()
+      .catch((error) => console.error('[playtester] Failed to stop metrics server', error));
     process.exit(1);
   }
 
@@ -29,9 +37,13 @@ async function bootstrap() {
       await runtime.close();
     } catch (error) {
       console.error('[playtester] Error during shutdown', error);
-    } finally {
-      process.exit(0);
     }
+    try {
+      await metricsServer.close();
+    } catch (error) {
+      console.error('[playtester] Failed to close metrics server', error);
+    }
+    process.exit(0);
   };
 
   const signals: NodeJS.Signals[] = ['SIGINT', 'SIGTERM'];

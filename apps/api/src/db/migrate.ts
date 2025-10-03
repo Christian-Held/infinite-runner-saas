@@ -81,6 +81,14 @@ export async function migrate(db: Database.Database): Promise<void> {
   `);
 
   db.exec(`
+    CREATE TABLE IF NOT EXISTS level_meta (
+      level_id TEXT PRIMARY KEY,
+      biome TEXT NOT NULL,
+      FOREIGN KEY(level_id) REFERENCES levels(id)
+    );
+  `);
+
+  db.exec(`
     CREATE TABLE IF NOT EXISTS season_jobs (
       season_id TEXT NOT NULL,
       level_number INTEGER NOT NULL,

@@ -12,7 +12,11 @@
     "playtester": "pnpm --filter @srv/playtester dev",
     "build": "pnpm -r run build",
     "lint": "pnpm -r run lint",
-    "format": "pnpm -r run format"
+    "format": "pnpm -r run format",
+    "dev:up": "powershell -ExecutionPolicy Bypass -File scripts/dev-up.ps1",
+    "dev:down": "powershell -ExecutionPolicy Bypass -File scripts/dev-down.ps1",
+    "prod:up": "powershell -ExecutionPolicy Bypass -File scripts/prod-up.ps1",
+    "prod:down": "powershell -ExecutionPolicy Bypass -File scripts/prod-down.ps1"
   },
   "devDependencies": {
     "@typescript-eslint/eslint-plugin": "^8.8.0",

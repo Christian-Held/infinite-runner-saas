@@ -181,6 +181,72 @@ function adjustHazard(level: LevelT, fail: Fail): TuneResult | null {
   return null;
 }
 
+function widenHazardWindow(level: LevelT, fail: Fail): TuneResult | null {
+  const patched = cloneLevel(level);
+  if (!patched.moving || patched.moving.length === 0) {
+    return null;
+  }
+
+  const details = (fail.details ?? {}) as Record<string, unknown>;
+  let movingIndex = -1;
+  if (typeof details.movingIndex === 'number' && Number.isFinite(details.movingIndex)) {
+    movingIndex = Math.floor(details.movingIndex);
+  }
+
+  if (movingIndex < 0 || movingIndex >= patched.moving.length) {
+    if (fail.at) {
+      const { x, y } = fail.at;
+      const candidate = patched.moving.findIndex((moving) => {
+        const center = {
+          x: (moving.from[0] + moving.to[0]) / 2,
+          y: (moving.from[1] + moving.to[1]) / 2,
+        };
+        return Math.hypot(center.x - x, center.y - y) <= 96;
+      });
+      if (candidate >= 0) {
+        movingIndex = candidate;
+      }
+    }
+  }
+
+  if (movingIndex < 0 || movingIndex >= patched.moving.length) {
+    movingIndex = 0;
+  }
+
+  const moving = { ...patched.moving[movingIndex] };
+  const targetOpen = (() => {
+    const minOpening = Number(details.minOpeningMs);
+    if (Number.isFinite(minOpening)) {
+      return Math.max(200, Math.round(minOpening));
+    }
+    return 200;
+  })();
+
+  if (typeof moving.open_ms === 'number') {
+    moving.open_ms = Math.max(targetOpen, Math.round(moving.open_ms + 80));
+  } else {
+    moving.open_ms = targetOpen;
+  }
+
+  const range = Array.isArray(details.periodRange) ? details.periodRange : [800, 2200];
+  const minPeriod = Number.isFinite(range[0]) ? Math.round(range[0] as number) : 800;
+  const maxPeriod = Number.isFinite(range[1]) ? Math.round(range[1] as number) : 2200;
+
+  if (moving.period_ms < minPeriod) {
+    moving.period_ms = minPeriod;
+  }
+  if (moving.period_ms < moving.open_ms + 200) {
+    moving.period_ms = Math.min(maxPeriod, moving.period_ms + 200);
+  }
+
+  patched.moving[movingIndex] = moving;
+
+  return finalizeLevel(patched, {
+    op: 'widen_hazard_window',
+    info: { movingIndex, open_ms: moving.open_ms, period_ms: moving.period_ms },
+  });
+}
+
 function adjustEnemy(level: LevelT, fail: Fail): TuneResult | null {
   const patched = cloneLevel(level);
   const details = (fail.details ?? {}) as Record<string, unknown>;
@@ -277,6 +343,8 @@ export function tune(level: LevelT, fail: Fail): TuneResult | null {
       return adjustGap(level, fail);
     case 'hazard_no_window':
       return adjustHazard(level, fail);
+    case 'hazard_window_small':
+      return widenHazardWindow(level, fail);
     case 'enemy_unavoidable':
       return adjustEnemy(level, fail);
     case 'no_spawn':

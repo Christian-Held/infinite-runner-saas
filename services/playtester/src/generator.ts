@@ -1,45 +1,24 @@
 import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { Ability, Level, getLevelPlan } from '@ir/game-spec';
+import {
+  Ability,
+  Level,
+  getBiome,
+  getLevelPlan,
+  type Biome,
+  type BiomeParams,
+} from '@ir/game-spec';
 import stringify from 'fast-json-stable-stringify';
-import IORedis from 'ioredis';
-import OpenAI from 'openai';
 import seedrandom from 'seedrandom';
 import { z } from 'zod';
 
+import { getOpenAIClient, getRedisClient, closeClients, getModel } from './clients';
+import { trackAndCheck } from './costguard';
 import { scoreLevel, withinBand } from './scoring';
 
-const OPENAI_MODEL = process.env.OPENAI_MODEL ?? 'gpt-4.1-mini';
-const OPENAI_REQ_TIMEOUT_MS = Number(process.env.OPENAI_REQ_TIMEOUT_MS ?? '20000');
-const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
 const GEN_MAX_ATTEMPTS = Number(process.env.GEN_MAX_ATTEMPTS ?? '3');
 const GEN_SIMHASH_TTL_SEC = Number(process.env.GEN_SIMHASH_TTL_SEC ?? '604800');
-
-let openaiClient: OpenAI | null = null;
-let redisClient: IORedis | null = null;
-
-export function clients(): { openai: OpenAI; redis: IORedis } {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new Error('OPENAI_API_KEY is not set');
-  }
-
-  if (!openaiClient) {
-    openaiClient = new OpenAI({
-      apiKey,
-      timeout: OPENAI_REQ_TIMEOUT_MS,
-    });
-  }
-
-  if (!redisClient) {
-    redisClient = new IORedis(REDIS_URL, {
-      enableOfflineQueue: false,
-    });
-  }
-
-  return { openai: openaiClient, redis: redisClient };
-}
 
 export interface GenerationConstraints {
   gravityY: number;
@@ -76,6 +55,43 @@ class ParseError extends Error {
     super(message);
     this.name = 'ParseError';
   }
+}
+
+type EnemyPattern = 'patrol' | 'chase' | 'projectile';
+
+interface HazardWindowConfig {
+  minOpenMs: number;
+  periodRange: [number, number];
+}
+
+function formatColorHex(color: number): string {
+  return `#${color.toString(16).padStart(6, '0')}`;
+}
+
+function allowedEnemyPatternsForLevel(levelNumber: number): EnemyPattern[] {
+  if (levelNumber >= 35) {
+    return ['patrol', 'chase', 'projectile'];
+  }
+  if (levelNumber >= 20) {
+    return ['patrol', 'chase'];
+  }
+  return ['patrol'];
+}
+
+function hazardWindowForLevel(levelNumber: number): HazardWindowConfig {
+  const t = Math.min(Math.max((levelNumber - 1) / 99, 0), 1);
+  const interpolated = 320 - (320 - 180) * t;
+  const minOpenMs = Math.max(180, Math.round(interpolated));
+  return { minOpenMs, periodRange: [800, 2200] };
+}
+
+function describeBiome(name: Biome, params: BiomeParams): string[] {
+  const palette = params.palette;
+  return [
+    `Biome: ${name}`,
+    `Palette BG ${formatColorHex(palette.bg)}, Plattform ${formatColorHex(palette.platform)}, Hazard ${formatColorHex(palette.hazard)}, Akzent ${formatColorHex(palette.accent)}`,
+    `Hinweise: Bodenreibung ${params.friction.toFixed(2)}, Hazard-Bias ${params.ambientHazardBias.toFixed(2)}, Moving-Bias ${params.movingBias.toFixed(2)}`,
+  ];
 }
 
 function buildMiniExample(
@@ -148,6 +164,9 @@ export function makePrompt(
       jetpack?: { fuel: number; thrust: number } | undefined;
     };
     seasonId?: string;
+    biome?: { name: Biome; params: BiomeParams };
+    enemyPatterns?: EnemyPattern[];
+    hazardWindow?: HazardWindowConfig;
   },
 ): PromptFragments {
   const abilitySummary = JSON.stringify(abilities);
@@ -183,12 +202,24 @@ export function makePrompt(
     if (limits.jetpack) {
       limitLines.push(`- Jetpack-Fuel: ${limits.jetpack.fuel} (Thrust ${limits.jetpack.thrust})`);
     }
+    const biomeLines = planDetails.biome ? describeBiome(planDetails.biome.name, planDetails.biome.params) : [];
+    const patternLine = planDetails.enemyPatterns?.length
+      ? [`Erlaubte Gegner-Muster: ${planDetails.enemyPatterns.join(', ')}`]
+      : [];
+    const hazardWindowLine = planDetails.hazardWindow
+      ? [
+          `Bewegende Gefahren: period_ms ${planDetails.hazardWindow.periodRange[0]}-${planDetails.hazardWindow.periodRange[1]} und offene Fenster >= ${planDetails.hazardWindow.minOpenMs} ms (Nutze open_ms für das Fenster).`,
+        ]
+      : [];
     userParts.push(
       `Level-Nummer: ${planDetails.levelNumber} / 100`,
       `Season: ${planDetails.seasonId ?? 'standalone'}`,
       `Ziel-Schwierigkeitsscore: ${planDetails.difficultyTarget} (Band ${bandMin}-${bandMax})`,
       'Grenzwerte für Inhalte:',
       ...limitLines,
+      ...biomeLines,
+      ...patternLine,
+      ...hazardWindowLine,
     );
   }
 
@@ -239,21 +270,21 @@ function createSignature(level: LevelShape): string {
 
 async function isDuplicate(signature: string): Promise<boolean> {
   const key = `sig:level:${signature}`;
-  const { redis } = clients();
+  const redis = getRedisClient();
   const existing = await redis.get(key);
   return Boolean(existing);
 }
 
 async function rememberSignature(signature: string, levelId: string): Promise<void> {
   const key = `sig:level:${signature}`;
-  const { redis } = clients();
+  const redis = getRedisClient();
   await redis.set(key, levelId, 'EX', GEN_SIMHASH_TTL_SEC);
 }
 
 async function callModel(prompt: PromptFragments) {
-  const { openai } = clients();
+  const openai = getOpenAIClient();
   const response = await openai.responses.create({
-    model: OPENAI_MODEL,
+    model: getModel(),
     input: [
       {
         role: 'system',
@@ -271,11 +302,19 @@ async function callModel(prompt: PromptFragments) {
   const text = response.output_text ?? '';
   const usage = response.usage ?? undefined;
   if (usage) {
-    console.info('[generator] usage', {
-      inputTokens: usage.input_tokens,
-      outputTokens: usage.output_tokens,
-      totalTokens: usage.total_tokens,
+    const guardResult = await trackAndCheck({
+      inputTokens: usage.input_tokens ?? 0,
+      outputTokens: usage.output_tokens ?? 0,
     });
+    console.info('[generator] usage', {
+      inputTokens: usage.input_tokens ?? 0,
+      outputTokens: usage.output_tokens ?? 0,
+      totalTokens: usage.total_tokens ?? 0,
+      remainingUsd: Number(guardResult.remainingUsd.toFixed(4)),
+    });
+    if (!guardResult.ok) {
+      throw new Error('budget_exceeded');
+    }
   }
   return text;
 }
@@ -295,6 +334,9 @@ export async function generateLevel(
     minPlatformWidthPX: plan.constraints.minPlatformWidthPX,
     maxStepUpPX: plan.constraints.maxStepUpPX,
   };
+  const { biome, params: biomeParams } = getBiome(plan.levelNumber);
+  const allowedPatterns = allowedEnemyPatternsForLevel(plan.levelNumber);
+  const hazardWindow = hazardWindowForLevel(plan.levelNumber);
   let guidance = '';
 
   for (let attempt = 0; attempt < GEN_MAX_ATTEMPTS; attempt += 1) {
@@ -310,6 +352,9 @@ export async function generateLevel(
         jetpack: plan.constraints.jetpack,
       },
       seasonId,
+      biome: { name: biome, params: biomeParams },
+      enemyPatterns: allowedPatterns,
+      hazardWindow,
     });
 
     try {
@@ -350,6 +395,64 @@ export async function generateLevel(
       candidateLevel.rules.duration_target_s = planConstraints.targetDurationSec;
       candidateLevel.seed = attemptSeed;
 
+      const enemyCount = candidateLevel.enemies?.length ?? 0;
+      if (
+        typeof plan.constraints.enemyMax === 'number' &&
+        enemyCount > plan.constraints.enemyMax
+      ) {
+        guidance = `Zu viele Gegner (${enemyCount}) gegenüber Maximum ${plan.constraints.enemyMax}. Reduziere die Anzahl.`;
+        await delay(250);
+        continue;
+      }
+
+      const disallowedPatterns = (candidateLevel.enemies ?? []).filter(
+        (enemy) => !allowedPatterns.includes(enemy.pattern as EnemyPattern),
+      );
+      if (disallowedPatterns.length > 0) {
+        const used = Array.from(new Set(disallowedPatterns.map((enemy) => enemy.pattern)));
+        guidance = `Unzulässige Gegner-Muster gefunden (${used.join(', ')}). Erlaubt sind: ${allowedPatterns.join(', ')}.`;
+        await delay(250);
+        continue;
+      }
+
+      const hazardCount = candidateLevel.tiles.filter((tile) => tile.type === 'hazard').length;
+      if (
+        typeof plan.constraints.hazardMax === 'number' &&
+        hazardCount > plan.constraints.hazardMax
+      ) {
+        guidance = `Gefahren überschreiten das Limit (${hazardCount} > ${plan.constraints.hazardMax}). Bitte reduzieren.`;
+        await delay(250);
+        continue;
+      }
+
+      const movingCount = candidateLevel.moving?.length ?? 0;
+      if (
+        typeof plan.constraints.movingMax === 'number' &&
+        movingCount > plan.constraints.movingMax
+      ) {
+        guidance = `Zu viele bewegliche Elemente (${movingCount} > ${plan.constraints.movingMax}).`;
+        await delay(250);
+        continue;
+      }
+
+      const invalidWindow = (candidateLevel.moving ?? []).find((entry) => {
+        if (typeof entry.open_ms !== 'number') {
+          return false;
+        }
+        if (entry.open_ms < hazardWindow.minOpenMs) {
+          return true;
+        }
+        const [minPeriod, maxPeriod] = hazardWindow.periodRange;
+        return entry.period_ms < minPeriod || entry.period_ms > maxPeriod;
+      });
+
+      if (invalidWindow) {
+        const [minPeriod, maxPeriod] = hazardWindow.periodRange;
+        guidance = `Hazard-Fenster zu knapp oder period_ms außerhalb Range. Stelle open_ms >= ${hazardWindow.minOpenMs} und period_ms ${minPeriod}-${maxPeriod} sicher.`;
+        await delay(250);
+        continue;
+      }
+
       const score = scoreLevel(candidateLevel);
       if (!withinBand(score, plan.difficultyBand)) {
         const direction = score < plan.difficultyTarget ? 'erhöhe' : 'reduziere';
@@ -387,15 +490,5 @@ export async function generateLevel(
 }
 
 export async function closeGenerator(): Promise<void> {
-  if (!redisClient) {
-    return;
-  }
-
-  try {
-    await redisClient.quit();
-  } catch {
-    redisClient.disconnect();
-  } finally {
-    redisClient = null;
-  }
+  await closeClients();
 }

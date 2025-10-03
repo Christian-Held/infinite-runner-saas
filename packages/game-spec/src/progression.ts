@@ -154,7 +154,7 @@ export function getLevelPlan(level: number): LevelPlan {
   const difficultyBand = bandForLevel(levelNumber);
   const abilities = baseAbilities(levelNumber);
 
-  const constraints = {
+  const constraints: LevelPlan['constraints'] = {
     maxGapPX: clamp(120 + levelNumber * 0.8, 120, 220),
     minPlatformWidthPX: clamp(48 - levelNumber * 0.1, 36, 48),
     maxStepUpPX: clamp(96 + levelNumber * 0.2, 96, 140),
