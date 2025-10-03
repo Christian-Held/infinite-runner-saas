@@ -10,6 +10,8 @@ const SAFETY_GAP_PX = 16;
 const MIN_PLATFORM_WIDTH = 48;
 const HAZARD_PERIOD_RANGE: [number, number] = [800, 2200];
 
+type HazardTile = Extract<LevelT['tiles'][number], { type: 'hazard' }>;
+
 function minHazardOpeningMs(levelNumber: number): number {
   const t = Math.min(Math.max((levelNumber - 1) / 99, 0), 1);
   const interpolated = 320 - (320 - 180) * t;
@@ -43,7 +45,7 @@ export interface GapDetail {
 
 export interface HazardDetail {
   tileIndex: number;
-  tile: LevelT['tiles'][number];
+  tile: HazardTile;
 }
 
 export interface Fail {
@@ -343,26 +345,65 @@ function mapSearchFail(level: LevelT, reason?: string): Fail {
   };
 }
 
-function findHazardNear(level: LevelT, point?: { x: number; y: number }) {
-  if (!point) {
+export function findHazardNear(
+  level: LevelT,
+  rect?: { x: number; y: number; w: number; h: number },
+): HazardDetail | null {
+  if (!rect) {
     return null;
   }
+
   const hazardEntries = level.tiles
     .map((tile, index) => ({ tile, index }))
-    .filter((entry) => entry.tile.type === 'hazard');
+    .filter((entry): entry is { tile: HazardTile; index: number } => entry.tile.type === 'hazard');
+
+  if (hazardEntries.length === 0) {
+    return null;
+  }
+
+  const centerX = rect.x + rect.w / 2;
+  const centerY = rect.y + rect.h / 2;
+
+  const overlaps = (
+    a: { x: number; y: number; w: number; h: number },
+    b: { x: number; y: number; w: number; h: number },
+  ): boolean => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+  let bestOverlap: { tileIndex: number; tile: HazardTile; distance: number } | null = null;
+  let bestNearby: { tileIndex: number; tile: HazardTile; distance: number } | null = null;
+
   for (const entry of hazardEntries) {
-    if (
-      point.x >= entry.tile.x &&
-      point.x <= entry.tile.x + entry.tile.w &&
-      point.y >= entry.tile.y &&
-      point.y <= entry.tile.y + entry.tile.h
-    ) {
-      return {
-        tileIndex: entry.index,
-        tile: { ...entry.tile },
-      } satisfies HazardDetail;
+    const tileRect = { x: entry.tile.x, y: entry.tile.y, w: entry.tile.w, h: entry.tile.h };
+    const tileCenterX = tileRect.x + tileRect.w / 2;
+    const tileCenterY = tileRect.y + tileRect.h / 2;
+    const dx = tileCenterX - centerX;
+    const dy = tileCenterY - centerY;
+    const distance = dx * dx + dy * dy;
+
+    if (overlaps(rect, tileRect)) {
+      if (!bestOverlap || distance < bestOverlap.distance) {
+        const tileCopy: HazardTile = { ...entry.tile };
+        bestOverlap = { tileIndex: entry.index, tile: tileCopy, distance };
+      }
+      continue;
+    }
+
+    if (Math.abs(dx) <= 24 && Math.abs(dy) <= 24) {
+      if (!bestNearby || distance < bestNearby.distance) {
+        const tileCopy: HazardTile = { ...entry.tile };
+        bestNearby = { tileIndex: entry.index, tile: tileCopy, distance };
+      }
     }
   }
+
+  if (bestOverlap) {
+    return { tileIndex: bestOverlap.tileIndex, tile: bestOverlap.tile };
+  }
+
+  if (bestNearby) {
+    return { tileIndex: bestNearby.tileIndex, tile: bestNearby.tile };
+  }
+
   return null;
 }
 
@@ -391,12 +432,23 @@ export async function testLevel(level: LevelT, logger: Logger): Promise<TestLeve
   if (!simulation.ok) {
     if (simulation.reason === 'hazard') {
       const failPoint = simulation.fail?.at;
-      const hazard = simulation.fail?.hazard ?? findHazardNear(level, failPoint ?? undefined);
+      const hazardRect =
+        simulation.fail?.hazard ??
+        (failPoint
+          ? { x: failPoint.x - 16, y: failPoint.y - 16, w: 32, h: 32 }
+          : undefined);
+      const hazard = findHazardNear(level, hazardRect);
+      const details: Record<string, unknown> = {};
+      if (hazard) {
+        details.hazard = hazard;
+      } else if (hazardRect) {
+        details.rect = hazardRect;
+      }
       const fail: Fail = {
         ok: false,
         reason: 'hazard_no_window',
         at: failPoint,
-        details: hazard ? { hazard } : undefined,
+        details: Object.keys(details).length > 0 ? details : undefined,
       };
       logger.warn(
         { reason: fail.reason, at: failPoint, nodes: search.nodes, durationMs: search.ms },

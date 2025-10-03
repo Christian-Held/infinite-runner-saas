@@ -1,8 +1,8 @@
-import assert from 'node:assert/strict';
+import { describe, expect, it } from 'vitest';
 
 import { LevelT } from '@ir/game-spec';
 
-import { createLogger } from '@ir/logger';
+import type { Logger } from '@ir/logger';
 
 import { tune } from './tuner';
 
@@ -28,73 +28,99 @@ function createLevel(partial: PartialLevel = {}): LevelT {
   };
 }
 
-function buildFail(details: Record<string, unknown>): Parameters<typeof tune>[1] {
-  return {
-    ok: false,
-    reason: 'hazard_window_small',
-    at: { x: 48, y: 0 },
-    details,
-  } as const;
-}
+const baseLogger = {
+  info: () => undefined,
+  error: () => undefined,
+  warn: () => undefined,
+  fatal: () => undefined,
+  debug: () => undefined,
+  trace: () => undefined,
+  child: () => baseLogger,
+};
+const logger = baseLogger as unknown as Logger;
 
-const logger = createLogger('tuner-test');
+describe('tuner', () => {
+  it('adjusts an existing hazard window to meet requirements', () => {
+    const level = createLevel({
+      moving: [
+        {
+          id: 'moving-1',
+          from: [0, 0],
+          to: [96, 0],
+          period_ms: 620,
+          phase: 0,
+          open_ms: 120,
+        },
+      ],
+    });
 
-function testAdjustsExistingWindow() {
-  const level = createLevel({
-    moving: [
-      {
-        id: 'moving-1',
-        from: [0, 0],
-        to: [96, 0],
-        period_ms: 620,
-        phase: 0,
-        open_ms: 120,
-      },
-    ],
+    const fail = {
+      ok: false,
+      reason: 'hazard_window_small' as const,
+      at: { x: 48, y: 0 },
+      details: { movingIndex: 0, minOpeningMs: 180, periodRange: [800, 1600] },
+    };
+    const result = tune(level, fail, logger);
+
+    expect(result).not.toBeNull();
+    expect(result?.patch.op).toBe('widen_hazard_window');
+    const moving = result?.patched.moving?.[0];
+    expect(moving?.open_ms).toBe(200);
+    expect(moving?.period_ms).toBe(800);
   });
 
-  const fail = buildFail({ movingIndex: 0, minOpeningMs: 180, periodRange: [800, 1600] });
-  const result = tune(level, fail, logger);
+  it('initialises a missing hazard window with sensible defaults', () => {
+    const level = createLevel({
+      moving: [
+        {
+          id: 'moving-2',
+          from: [0, 0],
+          to: [0, -96],
+          period_ms: 1500,
+          phase: 0.5,
+        },
+      ],
+    });
 
-  assert.ok(result, 'expected tune() to patch level');
-  assert.equal(result?.patch.op, 'widen_hazard_window');
-  const moving = result?.patched.moving?.[0];
-  assert.ok(moving, 'expected moving platform to exist');
-  assert.equal(moving.open_ms, 200);
-  assert.equal(moving.period_ms, 800);
-}
+    const fail = {
+      ok: false,
+      reason: 'hazard_window_small' as const,
+      at: { x: 0, y: 0 },
+      details: { movingIndex: 0, minOpeningMs: 260 },
+    };
+    const result = tune(level, fail, logger);
 
-function testInitialisesMissingWindow() {
-  const level = createLevel({
-    moving: [
-      {
-        id: 'moving-2',
-        from: [0, 0],
-        to: [0, -96],
-        period_ms: 1500,
-        phase: 0.5,
-      },
-    ],
+    expect(result).not.toBeNull();
+    const moving = result?.patched.moving?.[0];
+    expect(moving?.open_ms).toBe(260);
+    expect(moving?.period_ms).toBe(1500);
   });
 
-  const fail = buildFail({ movingIndex: 0, minOpeningMs: 260 });
-  const result = tune(level, fail, logger);
+  it('shifts hazard tiles downward when provided in fail details', () => {
+    const level = createLevel({
+      tiles: [
+        { x: 0, y: 200, w: 200, h: 20, type: 'ground' },
+        { x: 80, y: 180, w: 40, h: 20, type: 'hazard' },
+      ],
+    });
 
-  assert.ok(result, 'expected tune() to patch level');
-  const moving = result?.patched.moving?.[0];
-  assert.ok(moving, 'expected moving platform to exist');
-  assert.equal(moving.open_ms, 260);
-  assert.equal(moving.period_ms, 1500);
-}
+    const fail = {
+      ok: false,
+      reason: 'hazard_no_window' as const,
+      at: { x: 90, y: 180 },
+      details: {
+        hazard: {
+          tileIndex: 1,
+          tile: { x: 80, y: 180, w: 40, h: 20, type: 'hazard' as const },
+        },
+      },
+    };
 
-function run() {
-  testAdjustsExistingWindow();
-  testInitialisesMissingWindow();
-  console.log('tuner hazard window tests: ok');
-}
-
-if (import.meta.url === `file://${process.argv[1]}`) {
-  run();
-}
-
-export { run as runTunerHazardWindowTests };
+    const result = tune(level, fail, logger);
+    expect(result).not.toBeNull();
+    expect(result?.patch.op).toBe('shift_hazard');
+    const tile = result?.patched.tiles[1];
+    expect(tile.type).toBe('hazard');
+    expect(tile.y).toBe(188);
+  });
+});

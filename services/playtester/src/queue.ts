@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { Ability, getBiome } from '@ir/game-spec';
+import { resolveQueueConfig } from '@ir/queue-config';
 import { Queue, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { z } from 'zod';
@@ -25,6 +26,7 @@ import { scoreLevel } from './scoring';
 import { recordQueueJob } from './metrics';
 
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
+const queueConfig = resolveQueueConfig({ prefix: process.env.QUEUE_PREFIX });
 const MAX_TUNE_ROUNDS = Number.parseInt(process.env.TUNE_MAX_ROUNDS ?? '3', 10);
 
 const AbilityInputSchema = Ability;
@@ -62,19 +64,21 @@ export async function startWorkers(logger: Logger): Promise<WorkerRuntime> {
     queueLogger.error({ err: error }, 'Redis connection error');
   });
 
-  const genQueue = new Queue<GenJobData>('gen', {
+  const genQueue = new Queue<GenJobData>(queueConfig.names[0], {
     connection,
+    prefix: queueConfig.prefix,
     defaultJobOptions: { removeOnComplete: true },
   });
-  const testQueue = new Queue<TestJobData>('test', {
+  const testQueue = new Queue<TestJobData>(queueConfig.names[1], {
     connection,
+    prefix: queueConfig.prefix,
     defaultJobOptions: { removeOnComplete: true },
   });
 
   queueLogger.info(
     {
-      queues: ['gen', 'test'],
-      prefix: genQueue.opts.prefix ?? 'bull',
+      queues: [...queueConfig.names],
+      prefix: queueConfig.prefix,
     },
     'Starting playtester workers',
   );

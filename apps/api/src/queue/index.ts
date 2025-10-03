@@ -1,17 +1,15 @@
 import { Queue } from 'bullmq';
+import type { QueueOptions } from 'bullmq';
 import IORedis from 'ioredis';
 import { v4 as uuidv4 } from 'uuid';
 
 import { Ability } from '@ir/game-spec';
+import { resolveQueueConfig } from '@ir/queue-config';
+import type { Logger } from '@ir/logger';
 import { z } from 'zod';
 
 import { insertJob, updateJobStatus, upsertSeasonJob } from '../db';
 import { recordQueueOperation } from '../metrics';
-
-const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
-const BUDGET_ENV = process.env.BUDGET_USD_PER_DAY;
-const BUDGET_USD_PER_DAY = BUDGET_ENV ? Number.parseFloat(BUDGET_ENV) : Number.NaN;
-const HAS_BUDGET_GUARD = Number.isFinite(BUDGET_USD_PER_DAY) && BUDGET_USD_PER_DAY > 0;
 
 type AbilityInput = z.input<typeof Ability>;
 
@@ -53,24 +51,45 @@ function formatCostKey(date: Date): string {
   return `cost:day:${year}${month}${day}`;
 }
 
-export async function createQueueManager(): Promise<QueueManager> {
-  const connection = new IORedis(REDIS_URL);
+export interface CreateQueueManagerOptions {
+  redisUrl: string;
+  queuePrefix?: string;
+  budgetUsdPerDay: number | null;
+  logger?: Logger;
+}
 
-  const genQueue = new Queue<GenJobData>('gen', {
+export async function createQueueManager({
+  redisUrl,
+  queuePrefix,
+  budgetUsdPerDay,
+  logger,
+}: CreateQueueManagerOptions): Promise<QueueManager> {
+  const queueConfig = resolveQueueConfig({ prefix: queuePrefix });
+  const connection = new IORedis(redisUrl);
+
+  const createQueueOptions = (): QueueOptions => ({
     connection,
+    prefix: queueConfig.prefix,
     defaultJobOptions: {
       removeOnComplete: true,
     },
   });
-  const testQueue = new Queue('test', {
-    connection,
-    defaultJobOptions: {
-      removeOnComplete: true,
-    },
-  });
+
+  const genQueue = new Queue<GenJobData>(queueConfig.names[0], createQueueOptions());
+  const testQueue = new Queue(queueConfig.names[1], createQueueOptions());
+
+  logger?.info(
+    { queues: [...queueConfig.names], prefix: queueConfig.prefix },
+    'Queue manager configured',
+  );
+
+  const budgetLimit =
+    typeof budgetUsdPerDay === 'number' && Number.isFinite(budgetUsdPerDay) && budgetUsdPerDay > 0
+      ? budgetUsdPerDay
+      : null;
 
   async function readCurrentSpend(): Promise<number> {
-    if (!HAS_BUDGET_GUARD) {
+    if (budgetLimit === null) {
       return 0;
     }
     const raw = await connection.get(formatCostKey(new Date()));
@@ -82,24 +101,24 @@ export async function createQueueManager(): Promise<QueueManager> {
   }
 
   async function readBudgetStatus() {
-    if (!HAS_BUDGET_GUARD) {
+    if (budgetLimit === null) {
       return { limitUsd: null, remainingUsd: Number.POSITIVE_INFINITY, ok: true } as const;
     }
     const total = await readCurrentSpend();
-    const remaining = Math.max(0, BUDGET_USD_PER_DAY - total);
+    const remaining = Math.max(0, budgetLimit - total);
     return {
-      limitUsd: BUDGET_USD_PER_DAY,
+      limitUsd: budgetLimit,
       remainingUsd: remaining,
       ok: remaining > 0,
     } as const;
   }
 
   async function ensureBudgetAvailable(): Promise<boolean> {
-    if (!HAS_BUDGET_GUARD) {
+    if (budgetLimit === null) {
       return true;
     }
     const total = await readCurrentSpend();
-    return total < BUDGET_USD_PER_DAY;
+    return total < budgetLimit;
   }
 
   async function queueCounts<T>(queue: Queue<T>): Promise<QueueCounts> {
