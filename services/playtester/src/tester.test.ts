@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { LevelT } from '@ir/game-spec';
-import type { Logger } from '@ir/logger';
+import type { Logger } from '@pkg/logger';
 
 const hazardLevel: LevelT = {
   id: 'hazard-test',

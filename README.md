@@ -87,18 +87,31 @@ TUNE_MAX_ROUNDS=3
 
 | Service | Command (PowerShell) | Port(s) | Notes |
 | --- | --- | --- | --- |
-| API | `pnpm --filter api run dev:direct` | 3000 | Logs in `.logs/api-*.log` and stdout. |
+| API | `pnpm --filter api run dev:direct` | 3000 | Logs to stdout and `logs/api/run-<timestamp>-<pid>.log`. |
 | Web | `pnpm --filter web dev` | 3001 | Next.js dev server. |
-| Playtester | `pnpm --filter @srv/playtester dev` | 9100 (metrics) | Worker logs in `.logs/playtester-*.log`. |
+| Playtester | `pnpm --filter @srv/playtester dev` | 9100 (metrics) | Worker logs in `logs/playtester/run-<timestamp>-<pid>.log`. |
 | Redis (Docker) | `docker compose up redis -d` | 6379 | Data stored in Docker volume `infinite-runner-saas_redis-data`. |
 
 ## Logging
 
-* API logs rotate daily at `.logs/api-YYYY-MM-DD.log` and the playtester rotates under `.logs/playtester-YYYY-MM-DD.log`.
-* Tail logs in PowerShell with `Get-Content .\.logs\api-$(Get-Date -Format 'yyyy-MM-dd').log -Wait` (replace `api` with `playtester` as needed).
-* On startup the API and workers log their BullMQ queue names and prefix—use those messages to diagnose queue routing issues.
-* When `OPENAI_API_KEY` is missing the playtester logs an error before processing jobs; add the key and restart the worker.
-* Do not record secrets in log files; redact tokens before sharing snippets.
+All Node services stream logs to both stdout and JSON-line files under `logs/<service>/run-<ISO>-<pid>.log`. On development boots the logger deletes existing files for the service unless you opt out with `CLEAN_LOGS_ON_START=0`.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `LOG_DIR` | `<repo>/logs` | Root directory that contains per-service folders. |
+| `LOG_LEVEL` | `debug` | Applied to console and file streams. |
+| `CLEAN_LOGS_ON_START` | `1` when `NODE_ENV!=production`, else `0` | Controls whether old files are deleted before a new run. |
+
+Useful commands:
+
+* `pnpm logs:clean` – remove the entire `logs/` tree (honours `LOG_DIR`).
+* `pnpm logs:tail:api` / `pnpm logs:tail:playtester` – follow the newest run file for the service.
+
+Additional tips:
+
+* API request logs include method, URL, status code, duration (ms) and the request id; 4xx responses emit `warn` entries and 5xx responses emit `error` entries.
+* The playtester records GEN/TEST job lifecycle events, queue transitions, Redis connectivity updates and OpenAI token usage so you can reconstruct a job from a single `run-*.log` file.
+* Avoid pasting secrets into logs—scrub API keys or tokens before sharing snippets.
 
 ## Reset & Recovery Recipes
 
@@ -136,7 +149,7 @@ TUNE_MAX_ROUNDS=3
 apps/            # Frontend (web) and backend (api)
 packages/        # Shared libraries (game spec, logger)
 services/        # Long-running workers (playtester)
-.logs/           # Daily-rotated service logs (created on demand)
+logs/            # Service run logs (JSON lines, created on demand)
 deploy/          # Deployment manifests & scripts
 scripts/         # Windows helper scripts
 ```

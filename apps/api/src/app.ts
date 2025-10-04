@@ -2,7 +2,7 @@ import dotenv from 'dotenv';
 import IORedis from 'ioredis';
 import process from 'node:process';
 
-import { createLogger, bindUnhandled } from '@ir/logger';
+import { makeLogger } from '@pkg/logger';
 
 import { loadConfig, requireProdSecrets } from './config';
 import { openDb } from './db';
@@ -13,8 +13,7 @@ import { buildServer } from './server';
 dotenv.config();
 
 async function bootstrap() {
-  const logger = createLogger('api');
-  bindUnhandled(logger);
+  const logger = makeLogger('api');
 
   const config = loadConfig();
   requireProdSecrets(config);
@@ -133,7 +132,7 @@ async function main() {
   try {
     await bootstrap();
   } catch (error) {
-    const logger = createLogger('api');
+    const logger = makeLogger('api');
     logger.fatal({ err: error }, 'Fatal error during bootstrap');
     process.exit(1);
   }

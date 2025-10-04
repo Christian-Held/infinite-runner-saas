@@ -1,6 +1,6 @@
 import { LevelT, getLevelPlan } from '@ir/game-spec';
 
-import type { Logger } from '@ir/logger';
+import type { Logger } from '@pkg/logger';
 
 import { InputCmd, InputState, createSpawn, maxJumpGapPX, simulate } from './sim/arcade';
 import { findPath } from './sim/search';

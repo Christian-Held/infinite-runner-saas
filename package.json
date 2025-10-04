@@ -16,7 +16,10 @@
     "dev:up": "powershell -ExecutionPolicy Bypass -File scripts/dev-up.ps1",
     "dev:down": "powershell -ExecutionPolicy Bypass -File scripts/dev-down.ps1",
     "prod:up": "powershell -ExecutionPolicy Bypass -File scripts/prod-up.ps1",
-    "prod:down": "powershell -ExecutionPolicy Bypass -File scripts/prod-down.ps1"
+    "prod:down": "powershell -ExecutionPolicy Bypass -File scripts/prod-down.ps1",
+    "logs:clean": "node ./scripts/clean-logs.mjs",
+    "logs:tail:api": "node ./scripts/tail-log.mjs api",
+    "logs:tail:playtester": "node ./scripts/tail-log.mjs playtester"
   },
   "devDependencies": {
     "@typescript-eslint/eslint-plugin": "^8.8.0",

@@ -2,83 +2,150 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import { Writable } from 'node:stream';
+import { fileURLToPath } from 'node:url';
 
 import pino, { multistream, type Logger as PinoLogger, type StreamEntry } from 'pino';
 
-const LOG_DIRECTORY = path.resolve(process.cwd(), '.logs');
+const packageDirectory = fileURLToPath(new URL('.', import.meta.url));
+const repositoryRoot = path.resolve(packageDirectory, '..', '..', '..');
 
-function formatDate(date: Date): string {
-  return date.toISOString().slice(0, 10);
+const managedLoggers = new Map<string, ManagedLogger>();
+
+interface ManagedLogger {
+  logger: Logger;
+  fileStream: fs.WriteStream;
+  filePath: string;
+  cleanup: () => void;
 }
 
-class RotatingFileStream extends Writable {
-  private currentDate: string | null = null;
-
-  private destination: fs.WriteStream | null = null;
-
-  constructor(private readonly serviceName: string) {
-    super({ decodeStrings: false });
-    fs.mkdirSync(LOG_DIRECTORY, { recursive: true });
+function resolveLogRoot(): string {
+  const configured = process.env.LOG_DIR?.trim();
+  if (configured && configured.length > 0) {
+    return path.resolve(configured);
   }
-
-  private openStream(): void {
-    const today = formatDate(new Date());
-    if (this.currentDate === today && this.destination) {
-      return;
-    }
-
-    this.currentDate = today;
-    const filePath = path.join(LOG_DIRECTORY, `${this.serviceName}-${today}.log`);
-    if (this.destination) {
-      this.destination.end();
-    }
-    this.destination = fs.createWriteStream(filePath, { flags: 'a', encoding: 'utf8' });
-  }
-
-  override _write(
-    chunk: string | Buffer,
-    encoding: BufferEncoding,
-    callback: (error?: Error | null) => void,
-  ): void {
-    this.openStream();
-    if (!this.destination) {
-      callback(new Error('Failed to open log file destination'));
-      return;
-    }
-
-    const writable = this.destination.write(chunk, encoding);
-    if (writable) {
-      callback();
-      return;
-    }
-    this.destination.once('drain', callback);
-  }
-
-  override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
-    if (this.destination) {
-      this.destination.end(() => {
-        this.destination = null;
-        callback(error);
-      });
-      return;
-    }
-    callback(error);
-  }
+  return path.join(repositoryRoot, 'logs');
 }
 
-export interface BindUnhandledOptions {
-  exitOnFatal?: boolean;
+function shouldCleanLogsOnStart(): boolean {
+  const explicit = process.env.CLEAN_LOGS_ON_START?.trim();
+  if (explicit === '0') {
+    return false;
+  }
+  if (explicit === '1') {
+    return true;
+  }
+  return (process.env.NODE_ENV ?? '').toLowerCase() !== 'production';
+}
+
+function createRunFileName(): string {
+  const iso = new Date().toISOString().replace(/[:]/g, '-').replace(/\./g, '-');
+  return `run-${iso}-${process.pid}.log`;
+}
+
+function prepareServiceLogFile(serviceName: string): { filePath: string; stream: fs.WriteStream } {
+  const logRoot = resolveLogRoot();
+  const serviceDir = path.join(logRoot, serviceName);
+
+  if (shouldCleanLogsOnStart()) {
+    try {
+      fs.rmSync(serviceDir, { recursive: true, force: true });
+    } catch (error) {
+      console.warn(`Failed to clean logs for ${serviceName}:`, error);
+    }
+  }
+
+  fs.mkdirSync(serviceDir, { recursive: true });
+
+  const fileName = createRunFileName();
+  const filePath = path.join(serviceDir, fileName);
+  const stream = fs.createWriteStream(filePath, { flags: 'a', encoding: 'utf8' });
+  return { filePath, stream };
+}
+
+function flushStream(stream: fs.WriteStream): Promise<void> {
+  return new Promise((resolve) => {
+    if (stream.destroyed || stream.closed) {
+      resolve();
+      return;
+    }
+
+    stream.write('', 'utf8', () => {
+      if (stream.writableNeedDrain) {
+        stream.once('drain', () => resolve());
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function registerProcessHandlers(logger: Logger, fileStream: fs.WriteStream): () => void {
+  let shuttingDown = false;
+
+  const handleRejection = (reason: unknown, _promise: Promise<unknown>) => {
+    logger.error({ err: reason }, 'Unhandled promise rejection');
+  };
+
+  const handleException = (error: Error) => {
+    logger.fatal({ err: error }, 'Uncaught exception');
+  };
+
+  const handleSigint = (signal: NodeJS.Signals) => {
+    if (signal !== 'SIGINT') {
+      return;
+    }
+    logger.warn({ signal }, 'SIGINT received');
+  };
+
+  const handleSigterm = (signal: NodeJS.Signals) => {
+    if (signal !== 'SIGTERM') {
+      return;
+    }
+    logger.warn({ signal }, 'SIGTERM received');
+  };
+
+  const handleBeforeExit = async (code: number) => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    logger.info({ code }, 'Process exiting, flushing logs');
+    try {
+      logger.flush?.();
+      await flushStream(fileStream);
+    } catch (error) {
+      logger.error({ err: error }, 'Failed to flush logs on exit');
+    }
+  };
+
+  process.on('unhandledRejection', handleRejection);
+  process.on('uncaughtException', handleException);
+  process.on('SIGINT', handleSigint);
+  process.on('SIGTERM', handleSigterm);
+  process.on('beforeExit', handleBeforeExit);
+
+  return () => {
+    process.off('unhandledRejection', handleRejection);
+    process.off('uncaughtException', handleException);
+    process.off('SIGINT', handleSigint);
+    process.off('SIGTERM', handleSigterm);
+    process.off('beforeExit', handleBeforeExit);
+  };
 }
 
 export type Logger = PinoLogger;
 
-export function createLogger(serviceName: string): Logger {
-  const level = process.env.LOG_LEVEL ?? 'info';
-  const fileStream = new RotatingFileStream(serviceName);
+export function makeLogger(serviceName: string): Logger {
+  const existing = managedLoggers.get(serviceName);
+  if (existing) {
+    return existing.logger;
+  }
+
+  const { filePath, stream } = prepareServiceLogFile(serviceName);
+  const level = (process.env.LOG_LEVEL ?? 'debug').toLowerCase();
   const streams: StreamEntry[] = [
     { stream: process.stdout },
-    { stream: fileStream },
+    { stream },
   ];
 
   const baseLogger = pino(
@@ -89,35 +156,43 @@ export function createLogger(serviceName: string): Logger {
         pid: process.pid,
         hostname: os.hostname(),
       },
+      timestamp: pino.stdTimeFunctions.isoTime,
     },
     multistream(streams),
   );
 
+  const cleanup = registerProcessHandlers(baseLogger, stream);
+  managedLoggers.set(serviceName, {
+    logger: baseLogger,
+    fileStream: stream,
+    filePath,
+    cleanup,
+  });
+
   return baseLogger;
 }
 
-export function bindUnhandled(logger: Logger, options: BindUnhandledOptions = {}): () => void {
-  const { exitOnFatal = true } = options;
+export function getLogFilePath(serviceName: string): string | null {
+  const entry = managedLoggers.get(serviceName);
+  return entry?.filePath ?? null;
+}
 
-  const handleRejection = (reason: unknown) => {
-    logger.error({ err: reason }, 'Unhandled promise rejection');
-    if (exitOnFatal) {
-      process.exit(1);
-    }
-  };
+export function closeLogger(serviceName: string): void {
+  const entry = managedLoggers.get(serviceName);
+  if (!entry) {
+    return;
+  }
 
-  const handleException = (error: Error) => {
-    logger.fatal({ err: error }, 'Uncaught exception');
-    if (exitOnFatal) {
-      process.exit(1);
-    }
-  };
-
-  process.on('unhandledRejection', handleRejection);
-  process.on('uncaughtException', handleException);
-
-  return () => {
-    process.off('unhandledRejection', handleRejection);
-    process.off('uncaughtException', handleException);
-  };
+  entry.cleanup();
+  try {
+    entry.logger.flush?.();
+  } catch {
+    // ignore flush errors during shutdown
+  }
+  try {
+    entry.fileStream.end();
+  } catch {
+    // ignore errors when closing the stream
+  }
+  managedLoggers.delete(serviceName);
 }

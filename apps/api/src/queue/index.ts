@@ -6,7 +6,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { Ability } from '@ir/game-spec';
 import { resolveQueueConfig } from '@ir/queue-config';
-import type { Logger } from '@ir/logger';
+import type { Logger } from '@pkg/logger';
 import { z } from 'zod';
 
 import { insertJob, updateJobStatus, upsertSeasonJob } from '../db';

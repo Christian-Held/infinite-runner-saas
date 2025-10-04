@@ -1,8 +1,8 @@
-import { createLogger } from '@ir/logger';
 import IORedis from 'ioredis';
 import OpenAI from 'openai';
 
 import { cfg, getConfig } from './config';
+import { logger } from './logger';
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL ?? 'gpt-4.1-mini';
 const OPENAI_REQ_TIMEOUT_MS = Number(process.env.OPENAI_REQ_TIMEOUT_MS ?? '20000');
@@ -10,7 +10,7 @@ const OPENAI_REQ_TIMEOUT_MS = Number(process.env.OPENAI_REQ_TIMEOUT_MS ?? '20000
 let openaiClient: OpenAI | null = null;
 let redisClient: IORedis | null = null;
 
-const redisLogger = createLogger('playtester:redis-client');
+const redisLogger = logger.child({ module: 'redis-client' });
 
 export function getOpenAIClient(): OpenAI {
   const apiKey = cfg.openaiKey;
@@ -37,6 +37,15 @@ export function getRedisClient(): IORedis {
     });
     redisClient.on('error', (err) => {
       redisLogger.error({ err }, 'Redis client error');
+    });
+    redisClient.on('ready', () => {
+      redisLogger.info({ redisUrl: config.redisUrl }, 'Redis client ready');
+    });
+    redisClient.on('end', () => {
+      redisLogger.warn('Redis client connection ended');
+    });
+    redisClient.on('reconnecting', (delay) => {
+      redisLogger.warn({ delay }, 'Redis client reconnecting');
     });
   }
 
