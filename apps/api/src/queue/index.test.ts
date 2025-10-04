@@ -7,7 +7,7 @@ import type { Logger } from '@ir/logger';
 let createdQueues: { name: string; opts: { prefix?: string } }[] = [];
 
 vi.mock('bullmq', () => {
-  class QueueMock<T> {
+  class QueueMock {
     name: string;
     opts: { prefix?: string };
     constructor(name: string, opts: { prefix?: string }) {

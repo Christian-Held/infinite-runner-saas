@@ -5,7 +5,7 @@ import path from 'node:path';
 import { Level, LevelT, type Biome } from '@ir/game-spec';
 
 export type JobType = 'gen' | 'test';
-export type JobStatus = 'queued' | 'running' | 'failed' | 'succeeded';
+export type JobStatus = 'queued' | 'running' | 'failed' | 'succeeded' | 'canceled';
 export type SeasonJobStatus = 'queued' | 'running' | 'failed' | 'succeeded';
 
 export interface LevelMetricRecord {
@@ -54,6 +54,35 @@ export interface JobRecord {
   lastReason: string | null;
   createdAt: number;
   updatedAt: number;
+}
+
+export type BatchStatus = 'queued' | 'running' | 'partial' | 'succeeded' | 'failed' | 'canceled';
+
+export interface BatchRecord {
+  id: string;
+  status: BatchStatus;
+  requestedCount: number;
+  createdAt: number;
+  updatedAt: number;
+  params: unknown;
+  paramsJson: string;
+  idempotencyKey: string | null;
+}
+
+export interface BatchJobRecord {
+  batchId: string;
+  jobId: string;
+  status: JobStatus;
+  levelId: string | null;
+  error: string | null;
+  createdAt: number;
+  updatedAt: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+  durationMs: number | null;
+  levelNumber: number | null;
+  seed: string | null;
+  difficulty: number | null;
 }
 
 export interface LevelRecord {
@@ -120,6 +149,69 @@ interface LevelMetricRow {
   level_id: string;
   score: number;
   created_at: number;
+}
+
+interface BatchRow {
+  id: string;
+  status: string;
+  requested_count: number;
+  params_json: string;
+  idempotency_key: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+interface BatchJobRow {
+  batch_id: string;
+  job_id: string;
+  status: string;
+  level_id: string | null;
+  error: string | null;
+  created_at: number;
+  updated_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+  duration_ms: number | null;
+  level_number: number | null;
+  seed: string | null;
+  difficulty: number | null;
+}
+
+function rowToBatch(row: BatchRow): BatchRecord {
+  let params: unknown = null;
+  try {
+    params = JSON.parse(row.params_json);
+  } catch {
+    params = null;
+  }
+  return {
+    id: row.id,
+    status: row.status as BatchStatus,
+    requestedCount: row.requested_count,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    params,
+    paramsJson: row.params_json,
+    idempotencyKey: row.idempotency_key ?? null,
+  };
+}
+
+function rowToBatchJob(row: BatchJobRow): BatchJobRecord {
+  return {
+    batchId: row.batch_id,
+    jobId: row.job_id,
+    status: row.status as JobStatus,
+    levelId: row.level_id ?? null,
+    error: row.error ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    startedAt: row.started_at ?? null,
+    finishedAt: row.finished_at ?? null,
+    durationMs: row.duration_ms ?? null,
+    levelNumber: row.level_number ?? null,
+    seed: row.seed ?? null,
+    difficulty: row.difficulty ?? null,
+  };
 }
 
 interface SeasonJobRow {
@@ -442,6 +534,8 @@ export function updateJobStatus(
     Date.now(),
     id,
   );
+
+  updateBatchJobStatus(id, status, { levelId: options.levelId, error: options.error });
 }
 
 export function getJob(id: string): JobRecord | null {
@@ -634,4 +728,251 @@ export function pingDb(database: Database.Database = getDb()): boolean {
   } catch {
     return false;
   }
+}
+
+export function insertBatch(params: {
+  id: string;
+  requestedCount: number;
+  paramsJson: string;
+  status?: BatchStatus;
+  idempotencyKey?: string | null;
+  createdAt?: number;
+}): void {
+  const db = getDb();
+  const now = params.createdAt ?? Date.now();
+  const stmt = db.prepare(`
+    INSERT INTO batches (id, status, requested_count, params_json, idempotency_key, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  stmt.run(
+    params.id,
+    params.status ?? 'queued',
+    params.requestedCount,
+    params.paramsJson,
+    params.idempotencyKey ?? null,
+    now,
+    now,
+  );
+}
+
+export function findBatchById(batchId: string): BatchRecord | null {
+  const db = getDb();
+  const row = db.prepare('SELECT * FROM batches WHERE id = ?').get(batchId) as BatchRow | undefined;
+  if (!row) {
+    return null;
+  }
+  return rowToBatch(row);
+}
+
+export function findBatchByKey(key: string): BatchRecord | null {
+  const db = getDb();
+  const row = db.prepare('SELECT * FROM batches WHERE idempotency_key = ?').get(key) as
+    | BatchRow
+    | undefined;
+  if (!row) {
+    return null;
+  }
+  return rowToBatch(row);
+}
+
+export function insertBatchJobs(
+  entries: Array<{
+    batchId: string;
+    jobId: string;
+    status?: JobStatus;
+    createdAt?: number;
+    levelNumber?: number | null;
+    seed?: string | null;
+    difficulty?: number | null;
+  }>,
+): void {
+  if (entries.length === 0) {
+    return;
+  }
+  const db = getDb();
+  const stmt = db.prepare(`
+    INSERT INTO batch_jobs (
+      batch_id, job_id, status, level_id, error, created_at, updated_at,
+      started_at, finished_at, duration_ms, level_number, seed, difficulty
+    ) VALUES (?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, NULL, ?, ?, ?)
+  `);
+  for (const entry of entries) {
+    const timestamp = entry.createdAt ?? Date.now();
+    stmt.run(
+      entry.batchId,
+      entry.jobId,
+      entry.status ?? 'queued',
+      timestamp,
+      timestamp,
+      entry.levelNumber ?? null,
+      entry.seed ?? null,
+      entry.difficulty ?? null,
+    );
+  }
+}
+
+export function listBatchJobs(batchId: string): BatchJobRecord[] {
+  const db = getDb();
+  const rows = db
+    .prepare('SELECT * FROM batch_jobs WHERE batch_id = ? ORDER BY created_at ASC')
+    .all(batchId) as BatchJobRow[];
+  return rows.map(rowToBatchJob);
+}
+
+export function listBatches(params: {
+  limit: number;
+  cursor?: number;
+  ttlCutoff?: number;
+}): BatchRecord[] {
+  const db = getDb();
+  const conditions: string[] = [];
+  const values: unknown[] = [];
+  if (typeof params.ttlCutoff === 'number') {
+    conditions.push('created_at >= ?');
+    values.push(params.ttlCutoff);
+  }
+  if (typeof params.cursor === 'number') {
+    conditions.push('created_at < ?');
+    values.push(params.cursor);
+  }
+  let query = 'SELECT * FROM batches';
+  if (conditions.length > 0) {
+    query += ` WHERE ${conditions.join(' AND ')}`;
+  }
+  query += ' ORDER BY created_at DESC LIMIT ?';
+  values.push(Math.max(1, params.limit));
+  const rows = db.prepare(query).all(...values) as BatchRow[];
+  return rows.map(rowToBatch);
+}
+
+function recomputeBatchStatus(batchId: string): BatchStatus {
+  const db = getDb();
+  const counts = db
+    .prepare('SELECT status, COUNT(*) as count FROM batch_jobs WHERE batch_id = ? GROUP BY status')
+    .all(batchId) as Array<{ status: string; count: number }>;
+
+  let total = 0;
+  let queued = 0;
+  let running = 0;
+  let succeeded = 0;
+  let failed = 0;
+  let canceled = 0;
+
+  for (const row of counts) {
+    const count = row.count ?? 0;
+    total += count;
+    switch (row.status) {
+      case 'queued':
+        queued = count;
+        break;
+      case 'running':
+        running = count;
+        break;
+      case 'succeeded':
+        succeeded = count;
+        break;
+      case 'failed':
+        failed = count;
+        break;
+      case 'canceled':
+        canceled = count;
+        break;
+      default:
+        break;
+    }
+  }
+
+  const newStatus = (() => {
+    if (total === 0) {
+      return 'failed' as BatchStatus;
+    }
+    if (succeeded === total) {
+      return 'succeeded' as BatchStatus;
+    }
+    if (canceled === total) {
+      return 'canceled' as BatchStatus;
+    }
+    if (failed + canceled === total && succeeded === 0) {
+      return 'failed' as BatchStatus;
+    }
+    if (succeeded > 0 && (failed > 0 || canceled > 0)) {
+      return 'partial' as BatchStatus;
+    }
+    if (running > 0) {
+      return 'running' as BatchStatus;
+    }
+    if (queued === total) {
+      return 'queued' as BatchStatus;
+    }
+    return 'running' as BatchStatus;
+  })();
+
+  db.prepare('UPDATE batches SET status = ?, updated_at = ? WHERE id = ?').run(
+    newStatus,
+    Date.now(),
+    batchId,
+  );
+  return newStatus;
+}
+
+export function updateBatchJobStatus(
+  jobId: string,
+  status: JobStatus,
+  options: { levelId?: string | null; error?: string | null } = {},
+): void {
+  const db = getDb();
+  const existing = db.prepare('SELECT * FROM batch_jobs WHERE job_id = ?').get(jobId) as
+    | BatchJobRow
+    | undefined;
+  if (!existing) {
+    return;
+  }
+  const now = Date.now();
+  let startedAt = existing.started_at;
+  let finishedAt = existing.finished_at;
+  if (status === 'running' && !startedAt) {
+    startedAt = now;
+  }
+  if ((status === 'succeeded' || status === 'failed' || status === 'canceled') && !finishedAt) {
+    finishedAt = now;
+  }
+  let durationMs = existing.duration_ms;
+  if (finishedAt && (status === 'succeeded' || status === 'failed' || status === 'canceled')) {
+    const baseline = startedAt ?? existing.created_at;
+    durationMs = Math.max(0, finishedAt - baseline);
+  }
+  const levelId = options.levelId !== undefined ? options.levelId : existing.level_id;
+  const error = options.error !== undefined ? options.error : existing.error;
+
+  db.prepare(
+    `UPDATE batch_jobs
+     SET status = ?,
+         level_id = ?,
+         error = ?,
+         updated_at = ?,
+         started_at = ?,
+         finished_at = ?,
+         duration_ms = ?
+     WHERE job_id = ?`,
+  ).run(
+    status,
+    levelId ?? null,
+    error ?? null,
+    now,
+    startedAt ?? null,
+    finishedAt ?? null,
+    durationMs ?? null,
+    jobId,
+  );
+
+  recomputeBatchStatus(existing.batch_id);
+}
+
+export function setBatchStatus(batchId: string, status: BatchStatus): void {
+  const db = getDb();
+  db.prepare('UPDATE batches SET status = ?, updated_at = ? WHERE id = ?').run(
+    status,
+    Date.now(),
+    batchId,
+  );
 }

@@ -33,11 +33,7 @@ export const queueJobsDurationSeconds = new Histogram({
   registers: [registry],
 });
 
-export function recordQueueOperation(
-  queue: string,
-  status: string,
-  startedAt?: bigint,
-): void {
+export function recordQueueOperation(queue: string, status: string, startedAt?: bigint): void {
   queueJobsTotal.labels(queue, status).inc();
   if (startedAt) {
     const elapsed = Number(process.hrtime.bigint() - startedAt) / 1_000_000_000;
