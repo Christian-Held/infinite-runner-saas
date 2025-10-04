@@ -4,6 +4,7 @@ describe('config loader', () => {
   beforeEach(() => {
     vi.resetModules();
     delete process.env.REDIS_URL;
+    delete process.env.QUEUE_PREFIX;
     delete process.env.BULL_PREFIX;
     delete process.env.GEN_QUEUE;
     delete process.env.TEST_QUEUE;
@@ -31,7 +32,7 @@ describe('config loader', () => {
 
   it('respects environment overrides', async () => {
     process.env.REDIS_URL = 'redis://example:1234';
-    process.env.BULL_PREFIX = 'custom';
+    process.env.QUEUE_PREFIX = 'custom';
     process.env.GEN_QUEUE = 'genq';
     process.env.TEST_QUEUE = 'testq';
     process.env.API_BASE_URL = 'http://api.local';
@@ -52,5 +53,20 @@ describe('config loader', () => {
     expect(cfg.budgetUsdPerDay).toBe(10);
     expect(cfg.costPer1kInput).toBe(1.5);
     expect(cfg.costPer1kOutput).toBe(2.5);
+  });
+
+  it('prefers QUEUE_PREFIX over BULL_PREFIX', async () => {
+    process.env.QUEUE_PREFIX = 'queue-value';
+    process.env.BULL_PREFIX = 'bull-value';
+
+    const { cfg } = await import('../src/config');
+    expect(cfg.bullPrefix).toBe('queue-value');
+  });
+
+  it('falls back to BULL_PREFIX when QUEUE_PREFIX is absent', async () => {
+    process.env.BULL_PREFIX = 'legacy-bull';
+
+    const { cfg } = await import('../src/config');
+    expect(cfg.bullPrefix).toBe('legacy-bull');
   });
 });

@@ -197,6 +197,10 @@ docker exec -it infinite-runner-saas-redis-1 redis-cli MONITOR
    ```
 
 ## Debuggen auf Windows
+- ### Redis/BullMQ auf Windows
+  - BullMQ nutzt blocking Connections; unter Windows muss `maxRetriesPerRequest` auf `null` stehen, sonst beendet sich der Playtester beim Start mit dem Hinweis `BullMQ: Your redis options maxRetriesPerRequest must be null.`
+  - Stelle sicher, dass sowohl API als auch Worker IORedis immer mit `{ enableOfflineQueue: false, maxRetriesPerRequest: null }` initialisieren.
+
 - **Logs tailen:**
   ```powershell
   Get-Content .\.logs\api.err.log -Tail 120
@@ -219,20 +223,25 @@ docker exec -it infinite-runner-saas-redis-1 redis-cli MONITOR
 - Logs schreiben keine Secrets, dennoch beim Teilen Vorsicht.
 
 ## ENV-Referenz
-| NAME                | Default             | Komponente          | Beschreibung                                  | Prod erforderlich |
-|---------------------|---------------------|---------------------|-----------------------------------------------|-------------------|
-| `OPENAI_API_KEY`    | _(leer)_            | Playtester          | Key für OpenAI-API                            | Ja                |
-| `OPENAI_MODEL`      | `gpt-4.1-mini`      | Playtester          | Modell-ID für Levelgeneration                  | Ja                |
-| `REDIS_URL`         | `redis://127.0.0.1:6379` | API & Playtester | Redis-Verbindung für BullMQ                    | Ja                |
-| `API_BASE_URL`      | `http://localhost:3000` | Playtester      | Basis-URL der lokalen API                      | Ja                |
-| `INTERNAL_TOKEN`    | `dev-internal`      | API & Playtester    | Gemeinsames Secret für interne Endpunkte       | Ja                |
-| `DB_PATH`           | `./data/app.db`     | API                 | SQLite-Dateipfad                               | Ja                |
-| `BUDGET_USD_PER_DAY`| `5`                 | Playtester          | Tagesbudget für OpenAI-Aufrufe                 | Ja                |
-| `COST_PER_1K_INPUT` | `0`                 | Playtester          | Erwartete Kosten pro 1k Inputtoken             | Ja                |
-| `COST_PER_1K_OUTPUT`| `0`                 | Playtester          | Erwartete Kosten pro 1k Outputtoken            | Ja                |
-| `BULL_PREFIX`       | `bull`              | API & Playtester    | Redis-Prefix für BullMQ-Keys                   | Ja                |
-| `GEN_QUEUE`         | `gen`               | API & Playtester    | Name der Generation-Queue                      | Ja                |
-| `TEST_QUEUE`        | `test`              | API & Playtester    | Name der Test-Queue                            | Ja                |
+| NAME                 | Default                 | Komponente        | Beschreibung                                         | Prod erforderlich |
+|----------------------|-------------------------|-------------------|------------------------------------------------------|-------------------|
+| `OPENAI_API_KEY`     | _(leer)_                | Playtester        | Key für OpenAI-API                                   | Ja                |
+| `OPENAI_MODEL`       | `gpt-4.1-mini`          | Playtester        | Modell-ID für Levelgeneration                        | Ja                |
+| `REDIS_URL`          | `redis://127.0.0.1:6379`| API & Playtester  | Redis-Verbindung für BullMQ                          | Ja                |
+| `API_BASE_URL`       | `http://localhost:3000` | Playtester        | Basis-URL der lokalen API                            | Ja                |
+| `INTERNAL_TOKEN`     | `dev-internal`          | API & Playtester  | Gemeinsames Secret für interne Endpunkte             | Ja                |
+| `DB_PATH`            | `./data/app.db`         | API               | SQLite-Dateipfad                                     | Ja                |
+| `BUDGET_USD_PER_DAY` | `5`                     | Playtester        | Tagesbudget für OpenAI-Aufrufe                       | Ja                |
+| `COST_PER_1K_INPUT`  | `0`                     | Playtester        | Erwartete Kosten pro 1k Inputtoken                   | Ja                |
+| `COST_PER_1K_OUTPUT` | `0`                     | Playtester        | Erwartete Kosten pro 1k Outputtoken                  | Ja                |
+| `QUEUE_PREFIX`       | `bull`                  | API & Playtester  | Primärer Redis-Prefix für BullMQ-Keys                | Ja                |
+| `BULL_PREFIX`        | `bull`                  | API & Playtester  | Fallback-Prefix (Legacy), falls `QUEUE_PREFIX` fehlt | Ja                |
+| `GEN_QUEUE`          | `gen`                   | API & Playtester  | Name der Generation-Queue                           | Ja                |
+| `TEST_QUEUE`         | `test`                  | API & Playtester  | Name der Test-Queue                                 | Ja                |
+
+### ENV-Matrix
+- API und Playtester lesen `QUEUE_PREFIX`; der Playtester akzeptiert zusätzlich `BULL_PREFIX` als Fallback für ältere `.env`-Dateien.
+- Empfehlung: Setze `QUEUE_PREFIX` **und** `BULL_PREFIX` auf denselben Wert (Standard `bull`), damit beide Komponenten identische Redis-Keys verwenden.
 
 ## FAQ für Agents
 - **„Warum erst Redis?“** → Ohne Redis kein Queue-Backend; API-Jobs würden fehlschlagen.

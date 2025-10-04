@@ -47,10 +47,14 @@ vi.mock('bullmq', () => {
 
   const queues = new Map<string, FakeQueue<unknown>>();
   const workers = new Map<string, FakeWorker<unknown>>();
+  const queueOptions: Array<{ name: string; options?: { prefix?: string } }> = [];
+  const workerOptions: Array<{ name: string; options?: { prefix?: string } }> = [];
+  const queueEventsOptions: Array<{ name: string; options?: { prefix?: string } }> = [];
 
   class FakeQueue<T> {
     public jobs: FakeJob<T>[] = [];
-    constructor(public readonly name: string) {
+    constructor(public readonly name: string, public readonly options: { prefix?: string } = {}) {
+      queueOptions.push({ name, options });
       const existing = queues.get(name);
       if (existing) {
         return existing as unknown as FakeQueue<T>;
@@ -95,7 +99,9 @@ vi.mock('bullmq', () => {
     constructor(
       private readonly queueName: string,
       private readonly processor: (job: { id: string; data: T }) => Promise<unknown>,
+      public readonly options: { prefix?: string } = {},
     ) {
+      workerOptions.push({ name: queueName, options });
       workers.set(queueName, this as unknown as FakeWorker<unknown>);
       const queue = queues.get(queueName);
       if (queue) {
@@ -126,6 +132,9 @@ vi.mock('bullmq', () => {
   }
 
   class FakeQueueEvents {
+    constructor(public readonly name: string, public readonly options: { prefix?: string } = {}) {
+      queueEventsOptions.push({ name, options });
+    }
     on() {
       return this;
     }
@@ -134,19 +143,31 @@ vi.mock('bullmq', () => {
     }
   }
 
-  return { Queue: FakeQueue, Worker: FakeWorker, QueueEvents: FakeQueueEvents };
+  return {
+    Queue: FakeQueue,
+    Worker: FakeWorker,
+    QueueEvents: FakeQueueEvents,
+    queueOptions,
+    workerOptions,
+    queueEventsOptions,
+  };
 });
 
 vi.mock('ioredis', async () => {
   const mod = await import('ioredis-mock');
   const RedisMock = mod.default;
+  const ctor = vi.fn();
+
   class WrappedRedis extends RedisMock {
     constructor(...args: unknown[]) {
+      const [url, options] = args as [string, { [key: string]: unknown }?];
+      ctor(url, options ?? {});
       super(...(args as []));
       this.options = { ...(this.options ?? {}), keyPrefix: '' };
     }
   }
-  return { default: WrappedRedis };
+
+  return { default: WrappedRedis, __ctor: ctor };
 });
 
 describe('queue wiring', () => {
@@ -157,7 +178,8 @@ describe('queue wiring', () => {
     fetchMock.mockReset();
     globalThis.fetch = fetchMock as unknown as typeof fetch;
     process.env.REDIS_URL = 'redis://localhost:6379';
-    process.env.BULL_PREFIX = 'testbull';
+    process.env.QUEUE_PREFIX = 'testbull';
+    process.env.BULL_PREFIX = 'legacy-bull';
     process.env.GEN_QUEUE = 'gen';
     process.env.TEST_QUEUE = 'test';
     process.env.API_BASE_URL = 'http://localhost:3000';
@@ -227,5 +249,38 @@ describe('queue wiring', () => {
       const counts = await testQueue.getJobCounts('completed');
       expect(counts.completed ?? 0).toBeGreaterThanOrEqual(1);
     });
+
+    const redisModule = (await import('ioredis')) as unknown as { __ctor: ReturnType<typeof vi.fn> };
+    expect(
+      redisModule.__ctor.mock.calls.some(
+        ([url, options]) =>
+          url === 'redis://localhost:6379' &&
+          options &&
+          (options as { maxRetriesPerRequest?: unknown; enableOfflineQueue?: unknown }).maxRetriesPerRequest === null &&
+          (options as { maxRetriesPerRequest?: unknown; enableOfflineQueue?: unknown }).enableOfflineQueue === false,
+      ),
+    ).toBe(true);
+
+    const bull = (await import('bullmq')) as unknown as {
+      queueOptions: Array<{ name: string; options?: { prefix?: string } }>;
+      workerOptions: Array<{ name: string; options?: { prefix?: string } }>;
+      queueEventsOptions: Array<{ name: string; options?: { prefix?: string } }>;
+    };
+
+    expect(
+      bull.queueOptions
+        .filter((entry) => entry.name === cfg.genQueue || entry.name === cfg.testQueue)
+        .every((entry) => entry.options?.prefix === cfg.bullPrefix),
+    ).toBe(true);
+    expect(
+      bull.workerOptions
+        .filter((entry) => entry.name === cfg.genQueue || entry.name === cfg.testQueue)
+        .every((entry) => entry.options?.prefix === cfg.bullPrefix),
+    ).toBe(true);
+    expect(
+      bull.queueEventsOptions
+        .filter((entry) => entry.name === cfg.genQueue || entry.name === cfg.testQueue)
+        .every((entry) => entry.options?.prefix === cfg.bullPrefix),
+    ).toBe(true);
   });
 });

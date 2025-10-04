@@ -43,25 +43,6 @@ function durationMs(started: bigint): number {
   return Number(process.hrtime.bigint() - started) / 1_000_000;
 }
 
-function ensureKeyPrefix(client: IORedis): void {
-  const target = client as unknown as { options?: Record<string, unknown> };
-  target.options = { ...(target.options ?? {}), keyPrefix: target.options?.keyPrefix ?? '' };
-}
-
-function duplicateConnection(source: IORedis): IORedis {
-  const duplicate = source.duplicate();
-  const decorate = (client: IORedis): IORedis => {
-    ensureKeyPrefix(client);
-    const target = client as unknown as { duplicate?: () => IORedis };
-    if (typeof target.duplicate === 'function') {
-      const original = target.duplicate.bind(client);
-      target.duplicate = () => decorate(original());
-    }
-    return client;
-  };
-  return decorate(duplicate);
-}
-
 async function ensureBudgetAvailable(): Promise<void> {
   if (!Number.isFinite(cfg.budgetUsdPerDay) || cfg.budgetUsdPerDay <= 0) {
     return;
@@ -117,6 +98,12 @@ export async function startWorkers(): Promise<void> {
     return;
   }
 
+  if (!cfg.openaiKey) {
+    const error = new Error('OPENAI_API_KEY is not set');
+    logger.error({ err: error }, 'Cannot start playtester without OPENAI_API_KEY');
+    throw error;
+  }
+
   logger.info(
     {
       redisUrl: cfg.redisUrl,
@@ -129,8 +116,10 @@ export async function startWorkers(): Promise<void> {
     'Starting playtester workers',
   );
 
-  const connection = new IORedis(cfg.redisUrl, { enableOfflineQueue: false });
-  ensureKeyPrefix(connection);
+  const connection = new IORedis(cfg.redisUrl, {
+    enableOfflineQueue: false,
+    maxRetriesPerRequest: null,
+  });
   connection.on('error', (error) => {
     logger.error({ err: error }, 'Redis connection error');
   });
@@ -139,14 +128,8 @@ export async function startWorkers(): Promise<void> {
 
   const genQueue = new Queue<GenJobData>(cfg.genQueue, sharedQueueOptions);
   const testQueue = new Queue<TestJobData>(cfg.testQueue, sharedQueueOptions);
-  const genEvents = new QueueEvents(cfg.genQueue, {
-    connection: duplicateConnection(connection),
-    prefix: cfg.bullPrefix,
-  });
-  const testEvents = new QueueEvents(cfg.testQueue, {
-    connection: duplicateConnection(connection),
-    prefix: cfg.bullPrefix,
-  });
+  const genEvents = new QueueEvents(cfg.genQueue, sharedQueueOptions);
+  const testEvents = new QueueEvents(cfg.testQueue, sharedQueueOptions);
 
   const genWorker = new Worker<GenJobData>(
     cfg.genQueue,
@@ -180,11 +163,22 @@ export async function startWorkers(): Promise<void> {
         const testJobId = randomUUID();
 
         await safeCreateTestJobRecord({ jobId: testJobId, levelId });
-        await testQueue.add(
-          'test-level',
-          { levelId, jobId: testJobId },
-          { jobId: testJobId },
-        );
+        try {
+          await testQueue.add(
+            'test-level',
+            { levelId, jobId: testJobId },
+            { jobId: testJobId },
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          jobLogger.error({ err: error, testJobId, levelId }, 'Failed to enqueue TEST job');
+          await safeUpdateJobStatus(testJobId, {
+            status: 'failed',
+            levelId,
+            error: message,
+          });
+          throw error;
+        }
         await safeUpdateJobStatus(jobId, { status: 'succeeded', levelId });
 
         const duration = durationMs(started);
