@@ -18,6 +18,7 @@ import type { Logger } from '@ir/logger';
 import { getOpenAIClient, getRedisClient, closeClients, getModel } from './clients';
 import { trackAndCheck } from './costguard';
 import { scoreLevel, withinBand } from './scoring';
+import { cfg } from './config';
 
 const GEN_MAX_ATTEMPTS = Number(process.env.GEN_MAX_ATTEMPTS ?? '3');
 const GEN_SIMHASH_TTL_SEC = Number(process.env.GEN_SIMHASH_TTL_SEC ?? '604800');
@@ -332,6 +333,12 @@ export async function generateLevel(
   levelNumber?: number,
   seasonId?: string,
 ): Promise<LevelShape> {
+  if (!cfg.openaiKey) {
+    const error = new Error('missing_openai_key');
+    (error as Error & { code?: string }).code = 'missing_openai_key';
+    throw error;
+  }
+
   const plan = getLevelPlan(levelNumber ?? 1);
   const parsedAbilities = AbilitySchema.parse(abilities ?? plan.abilities);
   const planConstraints: GenerationConstraints = {
