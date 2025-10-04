@@ -23,6 +23,9 @@ describe('config', () => {
     expect(config.internalToken).toBe('dev-internal');
     expect(config.queue.prefix).toBe('bull');
     expect(config.queue.budgetUsdPerDay).toBeNull();
+    expect(config.batch.countMax).toBeGreaterThan(0);
+    expect(config.batch.maxParallelJobs).toBeGreaterThan(0);
+    expect(config.batch.rateLimit.max).toBeGreaterThan(0);
     expect(() => requireProdSecrets(config)).not.toThrow();
   });
 
@@ -33,7 +36,9 @@ describe('config', () => {
     const config = loadConfig();
 
     expect(config.internalToken).toBeUndefined();
-    expect(() => requireProdSecrets(config)).toThrowError('INTERNAL_TOKEN must be set in production');
+    expect(() => requireProdSecrets(config)).toThrowError(
+      'INTERNAL_TOKEN must be set in production',
+    );
   });
 
   it('respects provided internal token and budget configuration', () => {
@@ -47,6 +52,7 @@ describe('config', () => {
     expect(config.internalToken).toBe('super-secret');
     expect(config.queue.budgetUsdPerDay).toBe(12.5);
     expect(config.queue.prefix).toBe('staging');
+    expect(config.batch.countMax).toBeGreaterThan(0);
     expect(() => requireProdSecrets(config)).not.toThrow();
   });
 

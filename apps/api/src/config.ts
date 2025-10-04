@@ -17,6 +17,13 @@ const EnvSchema = z.object({
   INTERNAL_TOKEN: z.string().optional(),
   BUDGET_USD_PER_DAY: z.string().optional(),
   QUEUE_PREFIX: z.string().optional(),
+  BATCH_COUNT_MAX: z.string().optional(),
+  MAX_PARALLEL_JOBS: z.string().optional(),
+  JOB_QUEUE_BACKPRESSURE_MS: z.string().optional(),
+  REQUEST_BODY_LIMIT_BYTES: z.string().optional(),
+  BATCH_TTL_DAYS: z.string().optional(),
+  BATCH_RATE_MAX: z.string().optional(),
+  BATCH_RATE_WINDOW_MS: z.string().optional(),
 });
 
 export interface AppConfig {
@@ -31,6 +38,17 @@ export interface AppConfig {
     max: number;
     seasonMax: number;
     seasonWindowMs: number;
+  };
+  batch: {
+    countMax: number;
+    maxParallelJobs: number;
+    jobQueueBackpressureMs: number;
+    requestBodyLimitBytes: number;
+    ttlDays: number;
+    rateLimit: {
+      windowMs: number;
+      max: number;
+    };
   };
   queue: {
     prefix: string;
@@ -91,6 +109,30 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     seasonWindowMs: parseInteger(parsed.RATE_WINDOW_SEASON_MS, 600_000),
   };
 
+  const batchRateLimit = {
+    windowMs: parseInteger(parsed.BATCH_RATE_WINDOW_MS, 60_000),
+    max: parseInteger(parsed.BATCH_RATE_MAX, 5),
+  };
+
+  const safePositive = (value: number, fallback: number): number => {
+    if (!Number.isFinite(value) || value <= 0) {
+      return fallback;
+    }
+    return value;
+  };
+
+  const batch = {
+    countMax: safePositive(parseInteger(parsed.BATCH_COUNT_MAX, 1_000), 1_000),
+    maxParallelJobs: safePositive(parseInteger(parsed.MAX_PARALLEL_JOBS, 8), 8),
+    jobQueueBackpressureMs: safePositive(parseInteger(parsed.JOB_QUEUE_BACKPRESSURE_MS, 100), 100),
+    requestBodyLimitBytes: safePositive(
+      parseInteger(parsed.REQUEST_BODY_LIMIT_BYTES, 64 * 1024),
+      64 * 1024,
+    ),
+    ttlDays: safePositive(parseInteger(parsed.BATCH_TTL_DAYS, 30), 30),
+    rateLimit: batchRateLimit,
+  };
+
   const queueConfig = resolveQueueConfig({ prefix: parsed.QUEUE_PREFIX });
 
   const normalizedToken = parsed.INTERNAL_TOKEN?.trim();
@@ -109,6 +151,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     databasePath,
     originAllowList,
     rateLimit,
+    batch,
     queue: {
       prefix: queueConfig.prefix,
       budgetUsdPerDay: parseBudget(parsed.BUDGET_USD_PER_DAY),

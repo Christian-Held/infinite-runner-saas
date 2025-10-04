@@ -89,6 +89,43 @@ export async function migrate(db: Database.Database): Promise<void> {
   `);
 
   db.exec(`
+    CREATE TABLE IF NOT EXISTS batches (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      requested_count INTEGER NOT NULL,
+      params_json TEXT NOT NULL,
+      idempotency_key TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(idempotency_key)
+    );
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS batch_jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id TEXT NOT NULL,
+      job_id TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL,
+      level_id TEXT,
+      error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      started_at INTEGER,
+      finished_at INTEGER,
+      duration_ms INTEGER,
+      level_number INTEGER,
+      seed TEXT,
+      difficulty INTEGER,
+      FOREIGN KEY(batch_id) REFERENCES batches(id),
+      FOREIGN KEY(job_id) REFERENCES jobs(id)
+    );
+  `);
+
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_batches_created_at ON batches(created_at DESC);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_batch_jobs_batch_id ON batch_jobs(batch_id);`);
+
+  db.exec(`
     CREATE TABLE IF NOT EXISTS season_jobs (
       season_id TEXT NOT NULL,
       level_number INTEGER NOT NULL,

@@ -11,29 +11,40 @@ import type { Logger } from '@ir/logger';
 import { Ability, Level, getLevelPlan } from '@ir/game-spec';
 
 import {
+  findBatchById,
+  findBatchByKey,
   getJob,
   getLevel,
   getLevelMeta,
   getLevelPath,
   getLevelMetric,
   getSeasonStatus,
+  insertBatch,
   insertJob,
   insertLevel,
   insertLevelRevision,
+  insertBatchJobs,
+  listBatchJobs,
+  listBatches,
   listLevelRevisions,
   listLevels,
   listSeasonLevels,
   pingDb,
+  setBatchStatus,
   updateLevel,
   upsertLevelMeta,
   upsertLevelMetric,
   upsertLevelPath,
   updateJobStatus,
+  upsertSeasonJob,
   updateSeasonJob,
+  type BatchJobRecord,
+  type BatchRecord,
 } from './db';
 import type { QueueManager } from './queue';
 import { httpRequestDurationSeconds, httpRequestsTotal, registry } from './metrics';
 import type { AppConfig } from './config';
+import { parseBatchRequest } from './batches';
 
 const require = createRequire(import.meta.url);
 const { version: packageVersion } = require('../package.json') as { version?: string };
@@ -92,12 +103,12 @@ const IngestBody = z.object({
 const InternalJobBody = z.object({
   id: z.string(),
   type: z.enum(['gen', 'test']),
-  status: z.enum(['queued', 'running', 'failed', 'succeeded']).default('queued'),
+  status: z.enum(['queued', 'running', 'failed', 'succeeded', 'canceled']).default('queued'),
   levelId: z.string().nullable().optional(),
 });
 
 const UpdateJobBody = z.object({
-  status: z.enum(['queued', 'running', 'failed', 'succeeded']),
+  status: z.enum(['queued', 'running', 'failed', 'succeeded', 'canceled']),
   error: z.string().nullable().optional(),
   levelId: z.string().optional(),
   attempts: z.number().int().min(0).optional(),
@@ -158,6 +169,86 @@ const SeasonBuildBody = z
     path: ['to'],
   });
 
+interface BatchMetricsSummary {
+  total: number;
+  queued: number;
+  running: number;
+  succeeded: number;
+  failed: number;
+  canceled: number;
+  avgDurationMs: number | null;
+  p95DurationMs: number | null;
+}
+
+function computeBatchMetrics(batch: BatchRecord, jobs: BatchJobRecord[]): BatchMetricsSummary {
+  const metrics: BatchMetricsSummary = {
+    total: batch.requestedCount,
+    queued: 0,
+    running: 0,
+    succeeded: 0,
+    failed: 0,
+    canceled: 0,
+    avgDurationMs: null,
+    p95DurationMs: null,
+  };
+  const durations: number[] = [];
+
+  for (const job of jobs) {
+    switch (job.status) {
+      case 'queued':
+        metrics.queued += 1;
+        break;
+      case 'running':
+        metrics.running += 1;
+        break;
+      case 'succeeded':
+        metrics.succeeded += 1;
+        break;
+      case 'failed':
+        metrics.failed += 1;
+        break;
+      case 'canceled':
+        metrics.canceled += 1;
+        break;
+      default:
+        break;
+    }
+    if (typeof job.durationMs === 'number' && Number.isFinite(job.durationMs)) {
+      durations.push(job.durationMs);
+    }
+  }
+
+  if (durations.length > 0) {
+    const totalDuration = durations.reduce((sum, value) => sum + value, 0);
+    metrics.avgDurationMs = Math.round(totalDuration / durations.length);
+    const sorted = [...durations].sort((a, b) => a - b);
+    const index = Math.max(0, Math.floor(0.95 * (sorted.length - 1)));
+    metrics.p95DurationMs = sorted[index];
+  }
+
+  return metrics;
+}
+
+function successfulLevels(jobs: BatchJobRecord[]): string[] {
+  const levels = new Set<string>();
+  for (const job of jobs) {
+    if (job.status === 'succeeded' && typeof job.levelId === 'string' && job.levelId.length > 0) {
+      levels.add(job.levelId);
+    }
+  }
+  return Array.from(levels);
+}
+
+function jobErrors(jobs: BatchJobRecord[]): Array<{ job_id: string; message: string }> {
+  const errors: Array<{ job_id: string; message: string }> = [];
+  for (const job of jobs) {
+    if (job.error) {
+      errors.push({ job_id: job.jobId, message: job.error });
+    }
+  }
+  return errors;
+}
+
 const ListLevelsQuery = z.object({
   published: z.enum(['true', 'false']).optional(),
   limit: z.string().optional(),
@@ -166,6 +257,11 @@ const ListLevelsQuery = z.object({
 
 const SeasonLevelsQuery = z.object({
   published: z.enum(['true', 'false']).optional(),
+});
+
+const ListBatchesQuery = z.object({
+  limit: z.string().optional(),
+  cursor: z.string().optional(),
 });
 
 export function buildServer({
@@ -185,6 +281,7 @@ export function buildServer({
       }
       return randomUUID();
     },
+    bodyLimit: config.batch.requestBodyLimitBytes,
   });
 
   const enforceInternalToken = createInternalTokenHook(internalToken);
@@ -213,8 +310,15 @@ export function buildServer({
     seasonMax: RATE_MAX_SEASON,
     seasonWindowMs: RATE_WINDOW_SEASON_MS,
   } = config.rateLimit;
+  const {
+    rateLimit: batchRateLimit,
+    maxParallelJobs: MAX_PARALLEL_JOBS,
+    jobQueueBackpressureMs: JOB_QUEUE_BACKPRESSURE_MS,
+    ttlDays: BATCH_TTL_DAYS,
+  } = config.batch;
 
-  const ensurePositiveWindow = (windowMs: number) => (Number.isFinite(windowMs) && windowMs > 0 ? windowMs : 60000);
+  const ensurePositiveWindow = (windowMs: number) =>
+    Number.isFinite(windowMs) && windowMs > 0 ? windowMs : 60000;
 
   async function checkRateLimit(
     key: string,
@@ -343,6 +447,134 @@ export function buildServer({
     }
   });
 
+  server.post('/levels/generate-batch', async (request, reply) => {
+    const allowed = await checkRateLimit(
+      'levels:generate-batch',
+      request.ip,
+      batchRateLimit.max,
+      batchRateLimit.windowMs,
+    );
+    if (!allowed) {
+      reply.status(429).send({ error: 'rate_limited' });
+      return;
+    }
+
+    let parsed;
+    try {
+      parsed = parseBatchRequest(request.body ?? {}, config);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        reply.status(400).send({ error: 'validation_failed', details: error.flatten() });
+        return;
+      }
+      request.log.error({ err: error }, 'Failed to parse batch request');
+      reply.status(400).send({ error: 'invalid_request' });
+      return;
+    }
+
+    const { normalized, plans } = parsed;
+
+    if (normalized.idempotencyKey) {
+      const existing = findBatchByKey(normalized.idempotencyKey);
+      if (existing) {
+        if (existing.paramsJson !== normalized.fingerprint) {
+          reply.status(409).send({ error: 'idempotency_conflict' });
+          return;
+        }
+        const existingJobs = listBatchJobs(existing.id);
+        reply.send({
+          batch_id: existing.id,
+          job_ids: existingJobs.map((job) => job.jobId),
+          count: existing.requestedCount,
+        });
+        return;
+      }
+    }
+
+    const batchId = randomUUID();
+    const jobIds = plans.map(() => randomUUID());
+    const createdAt = Date.now();
+
+    const batchJobEntries = plans.map((plan, index) => ({
+      batchId,
+      jobId: jobIds[index],
+      status: 'queued' as const,
+      createdAt,
+      levelNumber: plan.levelNumber,
+      seed: plan.seed,
+      difficulty: plan.difficulty,
+    }));
+
+    const createBatchRecords = db.transaction(() => {
+      insertBatch({
+        id: batchId,
+        requestedCount: normalized.count,
+        paramsJson: normalized.fingerprint,
+        idempotencyKey: normalized.idempotencyKey ?? null,
+        status: 'queued',
+        createdAt,
+      });
+      plans.forEach((plan, index) => {
+        const jobId = jobIds[index];
+        insertJob({ id: jobId, type: 'gen', status: 'queued' });
+        if (normalized.season) {
+          upsertSeasonJob({
+            seasonId: normalized.season,
+            levelNumber: plan.levelNumber,
+            jobId,
+            status: 'queued',
+          });
+        }
+      });
+      insertBatchJobs(batchJobEntries);
+    });
+
+    try {
+      createBatchRecords();
+    } catch (error) {
+      request.log.error({ err: error }, 'Failed to create batch');
+      reply.status(500).send({ error: 'batch_creation_failed' });
+      return;
+    }
+
+    const jobsForQueue = plans.map((plan, index) => ({
+      jobId: jobIds[index],
+      data: {
+        seed: plan.seed,
+        difficulty: plan.difficulty,
+        abilities: plan.abilities,
+        seasonId: normalized.season ?? undefined,
+        levelNumber: plan.levelNumber,
+      },
+    }));
+
+    try {
+      await queueManager.enqueuePreparedGenJobs(jobsForQueue, {
+        maxParallel: MAX_PARALLEL_JOBS,
+        backpressureMs: JOB_QUEUE_BACKPRESSURE_MS,
+      });
+    } catch (error) {
+      request.log.error({ err: error, batchId }, 'Failed to enqueue batch jobs');
+      const processed = Array.isArray((error as { processed?: string[] }).processed)
+        ? ((error as { processed?: string[] }).processed ?? [])
+        : [];
+      const failedJobIds = jobIds.filter((jobId) => !processed.includes(jobId));
+      for (const jobId of failedJobIds) {
+        updateJobStatus(jobId, 'canceled', { error: 'enqueue_failed' });
+      }
+      setBatchStatus(batchId, 'failed');
+      if (error instanceof Error && error.message === 'budget_exceeded') {
+        reply.status(503).send({ error: 'budget_exceeded', batch_id: batchId });
+        return;
+      }
+      reply.status(500).send({ error: 'enqueue_failed', batch_id: batchId });
+      return;
+    }
+
+    request.log.info({ batchId, count: plans.length }, 'Batch enqueued');
+    reply.status(202).send({ batch_id: batchId, job_ids: jobIds, count: plans.length });
+  });
+
   server.post('/seasons/build', async (request, reply) => {
     const allowed = await checkRateLimit(
       'seasons:build',
@@ -387,8 +619,12 @@ export function buildServer({
 
     const limitCandidate = query.limit ? Number.parseInt(query.limit, 10) : Number.NaN;
     const offsetCandidate = query.offset ? Number.parseInt(query.offset, 10) : Number.NaN;
-    const limit = Number.isFinite(limitCandidate) && limitCandidate > 0 ? Math.min(limitCandidate, 100) : undefined;
-    const offset = Number.isFinite(offsetCandidate) && offsetCandidate >= 0 ? offsetCandidate : undefined;
+    const limit =
+      Number.isFinite(limitCandidate) && limitCandidate > 0
+        ? Math.min(limitCandidate, 100)
+        : undefined;
+    const offset =
+      Number.isFinite(offsetCandidate) && offsetCandidate >= 0 ? offsetCandidate : undefined;
 
     const records = listLevels({ published, limit, offset });
     const levels = records.map((entry) => ({
@@ -472,6 +708,89 @@ export function buildServer({
       return;
     }
     reply.send(job);
+  });
+
+  server.get('/batches/:id', async (request, reply) => {
+    const params = extractParams(request);
+    const id = z.string().parse(params.id);
+    const batch = findBatchById(id);
+    if (!batch) {
+      reply.status(404).send({ error: 'not_found' });
+      return;
+    }
+
+    const jobs = listBatchJobs(id);
+    const metrics = computeBatchMetrics(batch, jobs);
+    const levels = successfulLevels(jobs);
+    const errors = jobErrors(jobs);
+
+    reply.send({
+      batch_id: batch.id,
+      created_at: batch.createdAt,
+      updated_at: batch.updatedAt,
+      status: batch.status,
+      request: batch.params,
+      metrics: {
+        total: metrics.total,
+        queued: metrics.queued,
+        running: metrics.running,
+        succeeded: metrics.succeeded,
+        failed: metrics.failed,
+        canceled: metrics.canceled,
+        avg_duration_ms: metrics.avgDurationMs,
+        p95_duration_ms: metrics.p95DurationMs,
+      },
+      jobs: jobs.map((job) => ({
+        job_id: job.jobId,
+        status: job.status,
+        level_id: job.levelId,
+        error: job.error,
+      })),
+      levels,
+      errors,
+    });
+  });
+
+  server.get('/batches', async (request, reply) => {
+    const query = ListBatchesQuery.parse(extractQuery(request));
+    const limitCandidate = query.limit ? Number.parseInt(query.limit, 10) : Number.NaN;
+    const limit =
+      Number.isFinite(limitCandidate) && limitCandidate > 0 ? Math.min(limitCandidate, 50) : 25;
+    const cursorCandidate = query.cursor ? Number.parseInt(query.cursor, 10) : Number.NaN;
+    const cursor =
+      Number.isFinite(cursorCandidate) && cursorCandidate > 0 ? cursorCandidate : undefined;
+    const ttlCutoff =
+      typeof BATCH_TTL_DAYS === 'number' && Number.isFinite(BATCH_TTL_DAYS) && BATCH_TTL_DAYS > 0
+        ? Date.now() - BATCH_TTL_DAYS * 86_400_000
+        : undefined;
+
+    const records = listBatches({ limit, cursor, ttlCutoff });
+    const summaries = records.map((batch) => {
+      const jobs = listBatchJobs(batch.id);
+      const metrics = computeBatchMetrics(batch, jobs);
+      return {
+        batch_id: batch.id,
+        status: batch.status,
+        created_at: batch.createdAt,
+        updated_at: batch.updatedAt,
+        requested_count: batch.requestedCount,
+        request: batch.params,
+        metrics: {
+          total: metrics.total,
+          queued: metrics.queued,
+          running: metrics.running,
+          succeeded: metrics.succeeded,
+          failed: metrics.failed,
+          canceled: metrics.canceled,
+          avg_duration_ms: metrics.avgDurationMs,
+          p95_duration_ms: metrics.p95DurationMs,
+        },
+      };
+    });
+
+    const nextCursor =
+      summaries.length === limit ? (records[records.length - 1]?.createdAt ?? null) : null;
+    reply.send({ batches: summaries, next_cursor: nextCursor });
   });
 
   server.get('/seasons/:id/status', async (request, reply) => {

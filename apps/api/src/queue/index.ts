@@ -1,6 +1,7 @@
 import { Queue } from 'bullmq';
 import type { QueueOptions } from 'bullmq';
 import IORedis from 'ioredis';
+import { setTimeout as delay } from 'node:timers/promises';
 import { v4 as uuidv4 } from 'uuid';
 
 import { Ability } from '@ir/game-spec';
@@ -22,7 +23,14 @@ export interface GenJobData {
 }
 
 export interface QueueManager {
-  enqueueGen(input: GenJobData): Promise<string>;
+  enqueueGen(
+    input: GenJobData,
+    options?: { jobId?: string; skipInsert?: boolean },
+  ): Promise<string>;
+  enqueuePreparedGenJobs(
+    jobs: Array<{ jobId: string; data: GenJobData }>,
+    options: { maxParallel: number; backpressureMs: number },
+  ): Promise<string[]>;
   isHealthy(): Promise<boolean>;
   getQueueOverview(): Promise<{ gen: QueueCounts; test: QueueCounts }>;
   getBudgetStatus(): Promise<{ limitUsd: number | null; remainingUsd: number; ok: boolean }>;
@@ -132,26 +140,36 @@ export async function createQueueManager({
     };
   }
 
-  async function enqueueGen(input: GenJobData): Promise<string> {
-    const jobId = uuidv4();
+  async function enqueueGen(
+    input: GenJobData,
+    options: { jobId?: string; skipInsert?: boolean } = {},
+  ): Promise<string> {
+    const jobId = options.jobId ?? uuidv4();
     const startedAt = process.hrtime.bigint();
 
     if (!(await ensureBudgetAvailable())) {
       recordQueueOperation('gen', 'rejected', startedAt);
+      if (options.skipInsert) {
+        await updateJobStatus(jobId, 'failed', { error: 'budget_exceeded' });
+      }
       throw new Error('budget_exceeded');
     }
 
-    await insertJob({ id: jobId, type: 'gen', status: 'queued' });
-    if (input.seasonId && typeof input.levelNumber === 'number') {
-      upsertSeasonJob({
-        seasonId: input.seasonId,
-        levelNumber: input.levelNumber,
-        jobId,
-        status: 'queued',
-      });
+    if (!options.skipInsert) {
+      await insertJob({ id: jobId, type: 'gen', status: 'queued' });
+      if (input.seasonId && typeof input.levelNumber === 'number') {
+        upsertSeasonJob({
+          seasonId: input.seasonId,
+          levelNumber: input.levelNumber,
+          jobId,
+          status: 'queued',
+        });
+      }
     }
+
+    const payload: GenJobData = { ...input, jobId };
     try {
-      await genQueue.add('generate-level', input, { jobId });
+      await genQueue.add('generate-level', payload, { jobId });
       recordQueueOperation('gen', 'enqueued', startedAt);
     } catch (error) {
       const message = resolveErrorMessage(error);
@@ -160,6 +178,42 @@ export async function createQueueManager({
       throw error;
     }
     return jobId;
+  }
+
+  async function enqueuePreparedGenJobs(
+    jobs: Array<{ jobId: string; data: GenJobData }>,
+    options: { maxParallel: number; backpressureMs: number },
+  ): Promise<string[]> {
+    const maxParallel =
+      Number.isFinite(options.maxParallel) && options.maxParallel > 0 ? options.maxParallel : 0;
+    const backpressureMs =
+      Number.isFinite(options.backpressureMs) && options.backpressureMs > 0
+        ? options.backpressureMs
+        : 50;
+    const processed: string[] = [];
+
+    for (const job of jobs) {
+      if (maxParallel > 0) {
+        // Simple backpressure loop: wait until the queue has spare capacity.
+        while (true) {
+          const counts = await genQueue.getJobCounts('waiting', 'active');
+          const inflight = (counts.waiting ?? 0) + (counts.active ?? 0);
+          if (inflight < maxParallel) {
+            break;
+          }
+          await delay(backpressureMs);
+        }
+      }
+      try {
+        await enqueueGen(job.data, { jobId: job.jobId, skipInsert: true });
+        processed.push(job.jobId);
+      } catch (error) {
+        const enriched = error instanceof Error ? error : new Error(String(error));
+        (enriched as Error & { processed?: string[] }).processed = [...processed];
+        throw enriched;
+      }
+    }
+    return processed;
   }
 
   async function isHealthyRedis(): Promise<boolean> {
@@ -182,6 +236,7 @@ export async function createQueueManager({
 
   return {
     enqueueGen,
+    enqueuePreparedGenJobs,
     isHealthy: isHealthyRedis,
     getQueueOverview: async () => ({
       gen: await queueCounts(genQueue),
