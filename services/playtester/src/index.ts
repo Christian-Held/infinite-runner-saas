@@ -1,11 +1,8 @@
 import 'dotenv/config';
 
-import { createLogger } from '@ir/logger';
-
 import { cfg } from './config';
 import { startWorkers, stopWorkers } from './queue';
-
-const logger = createLogger('playtester');
+import { logger } from './logger';
 
 async function main() {
   logger.info(

@@ -1,6 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises';
 
-import type { Logger } from '@ir/logger';
+import type { Logger } from '@pkg/logger';
 
 import { cfg } from './config';
 

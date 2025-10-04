@@ -13,7 +13,7 @@ import stringify from 'fast-json-stable-stringify';
 import seedrandom from 'seedrandom';
 import { z } from 'zod';
 
-import type { Logger } from '@ir/logger';
+import type { Logger } from '@pkg/logger';
 
 import { getOpenAIClient, getRedisClient, closeClients, getModel } from './clients';
 import { trackAndCheck } from './costguard';

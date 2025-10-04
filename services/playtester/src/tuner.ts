@@ -1,6 +1,6 @@
 import { Level, LevelT } from '@ir/game-spec';
 
-import type { Logger } from '@ir/logger';
+import type { Logger } from '@pkg/logger';
 
 import { Fail, GapDetail, HazardDetail } from './tester';
 

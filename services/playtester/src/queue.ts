@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
 import { Ability, Level, type LevelT } from '@ir/game-spec';
-import { createLogger } from '@ir/logger';
 import { Queue, QueueEvents, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { z } from 'zod';
@@ -13,7 +12,7 @@ import { closeGenerator, generateLevel } from './generator';
 import { scoreLevel } from './scoring';
 import { testLevel } from './tester';
 
-const logger = createLogger('playtester');
+import { logger } from './logger';
 
 interface GenJobData {
   jobId?: string;
@@ -36,6 +35,8 @@ interface WorkerState {
   genEvents: QueueEvents;
   testEvents: QueueEvents;
 }
+
+const queueEventLogger = logger.child({ module: 'queue-events' });
 
 let state: WorkerState | null = null;
 
@@ -123,6 +124,15 @@ export async function startWorkers(): Promise<void> {
   connection.on('error', (error) => {
     logger.error({ err: error }, 'Redis connection error');
   });
+  connection.on('ready', () => {
+    logger.info({ redisUrl: cfg.redisUrl }, 'Redis connection ready');
+  });
+  connection.on('end', () => {
+    logger.warn('Redis connection ended');
+  });
+  connection.on('reconnecting', (delay) => {
+    logger.warn({ delay }, 'Redis reconnecting');
+  });
 
   const sharedQueueOptions = { connection, prefix: cfg.bullPrefix };
 
@@ -131,14 +141,44 @@ export async function startWorkers(): Promise<void> {
   const genEvents = new QueueEvents(cfg.genQueue, sharedQueueOptions);
   const testEvents = new QueueEvents(cfg.testQueue, sharedQueueOptions);
 
+  const attachQueueEvents = (events: QueueEvents, queueName: 'gen' | 'test') => {
+    const eventLogger = queueEventLogger.child({ queue: queueName });
+    events.on('waiting', ({ jobId }) => {
+      eventLogger.info({ jobId }, 'Job enqueued');
+    });
+    events.on('active', ({ jobId, prev }) => {
+      eventLogger.info({ jobId, previous: prev }, 'Job active');
+    });
+    events.on('stalled', ({ jobId }) => {
+      eventLogger.warn({ jobId }, 'Job stalled');
+    });
+    events.on('completed', ({ jobId, returnvalue }) => {
+      eventLogger.info({ jobId, result: returnvalue }, 'Job completed');
+    });
+    events.on('failed', ({ jobId, failedReason }) => {
+      eventLogger.error({ jobId, reason: failedReason }, 'Job failed');
+    });
+  };
+
+  attachQueueEvents(genEvents, 'gen');
+  attachQueueEvents(testEvents, 'test');
+
   const genWorker = new Worker<GenJobData>(
     cfg.genQueue,
     async (job) => {
       const started = process.hrtime.bigint();
       const jobId = typeof job.data?.jobId === 'string' ? job.data.jobId : job.id;
       const jobLogger = logger.child({ queue: 'gen', jobId });
+      let levelId: string | null = null;
 
-      jobLogger.info({ data: job.data }, 'GEN job started');
+      jobLogger.info(
+        {
+          jobId,
+          attempt: job.attemptsMade + 1,
+          data: job.data,
+        },
+        'GEN job started',
+      );
       try {
         await safeUpdateJobStatus(jobId, { status: 'running' });
         await ensureBudgetAvailable();
@@ -159,7 +199,7 @@ export async function startWorkers(): Promise<void> {
           logger: jobLogger,
         });
 
-        const levelId = ingest.id;
+        levelId = ingest.id;
         const testJobId = randomUUID();
 
         await safeCreateTestJobRecord({ jobId: testJobId, levelId });
@@ -182,12 +222,15 @@ export async function startWorkers(): Promise<void> {
         await safeUpdateJobStatus(jobId, { status: 'succeeded', levelId });
 
         const duration = durationMs(started);
-        jobLogger.info({ levelId, durationMs: duration }, 'GEN job completed');
+        jobLogger.info({ jobId, levelId, durationMs: duration }, 'GEN job completed');
 
         return { levelId, jobId, testJobId };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        jobLogger.error({ err: error, durationMs: durationMs(started) }, 'GEN job failed');
+        jobLogger.error(
+          { err: error, jobId, levelId, durationMs: durationMs(started) },
+          'GEN job failed',
+        );
         await safeUpdateJobStatus(jobId, { status: 'failed', error: message });
         throw error;
       }
@@ -200,7 +243,14 @@ export async function startWorkers(): Promise<void> {
     async (job) => {
       const started = process.hrtime.bigint();
       const jobLogger = logger.child({ queue: 'test', jobId: job.data.jobId });
-      jobLogger.info({ data: job.data }, 'TEST job started');
+      jobLogger.info(
+        {
+          jobId: job.data.jobId,
+          attempt: job.attemptsMade + 1,
+          levelId: job.data.levelId,
+        },
+        'TEST job started',
+      );
       try {
         await safeUpdateJobStatus(job.data.jobId, {
           status: 'running',
@@ -235,7 +285,10 @@ export async function startWorkers(): Promise<void> {
             levelId: job.data.levelId,
           });
           const duration = durationMs(started);
-          jobLogger.info({ durationMs: duration }, 'TEST job completed');
+          jobLogger.info(
+            { jobId: job.data.jobId, levelId: job.data.levelId, durationMs: duration },
+            'TEST job completed',
+          );
           return { ok: true, levelId: job.data.levelId };
         }
 
@@ -255,7 +308,15 @@ export async function startWorkers(): Promise<void> {
           levelId: job.data.levelId,
           error: message,
         });
-        jobLogger.error({ err: error, durationMs: durationMs(started) }, 'TEST job failed');
+        jobLogger.error(
+          {
+            err: error,
+            jobId: job.data.jobId,
+            levelId: job.data.levelId,
+            durationMs: durationMs(started),
+          },
+          'TEST job failed',
+        );
         throw error;
       }
     },

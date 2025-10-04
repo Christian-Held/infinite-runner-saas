@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { LevelT } from '@ir/game-spec';
 
-import type { Logger } from '@ir/logger';
+import type { Logger } from '@pkg/logger';
 
 import { tune } from './tuner';
 

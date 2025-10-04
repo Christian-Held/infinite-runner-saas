@@ -1,6 +1,6 @@
 {
-  "name": "@ir/logger",
-  "version": "0.1.0",
+  "name": "@pkg/logger",
+  "version": "0.2.0",
   "private": false,
   "type": "module",
   "exports": {

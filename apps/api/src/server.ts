@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 
-import type { Logger } from '@ir/logger';
+import type { Logger } from '@pkg/logger';
 
 import { Ability, Level, getLevelPlan } from '@ir/game-spec';
 
@@ -346,6 +346,14 @@ export function buildServer({
 
   server.addHook('onRequest', (request, _reply, done) => {
     (request as FastifyRequest & { metricsStart?: bigint }).metricsStart = process.hrtime.bigint();
+    request.log.info(
+      {
+        reqId: request.id,
+        method: request.method,
+        url: request.url,
+      },
+      'incoming request',
+    );
     done();
   });
 
@@ -361,7 +369,9 @@ export function buildServer({
     const durationMs = metricsStart
       ? Number(process.hrtime.bigint() - metricsStart) / 1_000_000
       : reply.getResponseTime();
-    request.log.info(
+    const level: 'info' | 'warn' | 'error' =
+      reply.statusCode >= 500 ? 'error' : reply.statusCode >= 400 ? 'warn' : 'info';
+    request.log[level](
       {
         reqId: request.id,
         method: request.method,

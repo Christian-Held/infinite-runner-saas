@@ -14,7 +14,7 @@ vi.mock('openai', () => {
   return { OpenAI: FakeClient };
 });
 
-vi.mock('@ir/logger', () => {
+vi.mock('@pkg/logger', () => {
   const noop = () => undefined;
   const logger: Record<string, unknown> = {
     info: vi.fn(noop),
@@ -25,8 +25,11 @@ vi.mock('@ir/logger', () => {
     fatal: vi.fn(noop),
   };
   (logger as { child: ReturnType<typeof vi.fn> }).child = vi.fn(() => logger);
+  (logger as { flush: ReturnType<typeof vi.fn> }).flush = vi.fn();
 
   return {
-    createLogger: vi.fn(() => logger),
+    makeLogger: vi.fn(() => logger),
+    getLogFilePath: vi.fn(() => null),
+    closeLogger: vi.fn(),
   };
 });

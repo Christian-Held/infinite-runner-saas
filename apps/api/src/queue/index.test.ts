@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, vi } from 'vitest';
 
 import { resolveQueueConfig } from '@ir/queue-config';
 
-import type { Logger } from '@ir/logger';
+import type { Logger } from '@pkg/logger';
 
 let createdQueues: { name: string; opts: { prefix?: string } }[] = [];
 
