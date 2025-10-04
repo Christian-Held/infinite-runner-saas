@@ -29,6 +29,7 @@ export function getRedisClient(): IORedis {
   if (!redisClient) {
     redisClient = new IORedis(cfg.redisUrl, {
       enableOfflineQueue: false,
+      maxRetriesPerRequest: null,
     });
   }
 

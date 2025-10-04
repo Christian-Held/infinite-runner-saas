@@ -13,3 +13,20 @@ vi.mock('openai', () => {
   }
   return { OpenAI: FakeClient };
 });
+
+vi.mock('@ir/logger', () => {
+  const noop = () => undefined;
+  const logger: Record<string, unknown> = {
+    info: vi.fn(noop),
+    warn: vi.fn(noop),
+    error: vi.fn(noop),
+    debug: vi.fn(noop),
+    trace: vi.fn(noop),
+    fatal: vi.fn(noop),
+  };
+  (logger as { child: ReturnType<typeof vi.fn> }).child = vi.fn(() => logger);
+
+  return {
+    createLogger: vi.fn(() => logger),
+  };
+});

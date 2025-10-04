@@ -2,7 +2,7 @@ import 'dotenv/config';
 
 export const cfg = {
   redisUrl: process.env.REDIS_URL ?? 'redis://127.0.0.1:6379',
-  bullPrefix: process.env.BULL_PREFIX ?? 'bull',
+  bullPrefix: process.env.QUEUE_PREFIX ?? process.env.BULL_PREFIX ?? 'bull',
   genQueue: process.env.GEN_QUEUE ?? 'gen',
   testQueue: process.env.TEST_QUEUE ?? 'test',
   apiBase: process.env.API_BASE_URL ?? 'http://localhost:3000',
