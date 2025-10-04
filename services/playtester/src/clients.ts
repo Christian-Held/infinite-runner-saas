@@ -45,8 +45,35 @@ export function getRedisClient(): IORedis {
 
 export async function getReadyRedis(): Promise<IORedis> {
   const client = getRedisClient();
+  if (client.status === 'ready') {
+    return client;
+  }
+
+  if (client.status === 'wait' || client.status === 'end' || client.status === 'close') {
+    try {
+      await client.connect();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : '';
+      if (!/already connecting|connected/i.test(message)) {
+        throw err;
+      }
+    }
+  }
+
   if (client.status !== 'ready') {
-    await client.connect();
+    await new Promise<void>((resolve, reject) => {
+      const onReady = () => {
+        client.off('error', onError);
+        resolve();
+      };
+      const onError = (err: unknown) => {
+        client.off('ready', onReady);
+        reject(err);
+      };
+
+      client.once('ready', onReady);
+      client.once('error', onError);
+    });
   }
   return client;
 }
