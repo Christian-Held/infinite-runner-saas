@@ -14,3 +14,7 @@ export const cfg = {
 } as const;
 
 export type Config = typeof cfg;
+
+export function getConfig(): Config {
+  return cfg;
+}

@@ -1,4 +1,4 @@
-import { getRedisClient } from './clients';
+import { getReadyRedis } from './clients';
 import { cfg } from './config';
 
 export interface Usage {
@@ -35,7 +35,7 @@ function secondsUntilEndOfDay(date: Date): number {
 export async function trackAndCheck(
   usage: Usage,
 ): Promise<{ ok: boolean; remainingUsd: number }> {
-  const redis = getRedisClient();
+  const redis = await getReadyRedis();
   const now = new Date();
   const key = formatKey(now);
   const increment = calculateUsd(usage);
