@@ -1,33 +1,25 @@
 import 'dotenv/config';
 
-import { createLogger, bindUnhandled } from '@ir/logger';
+import { createLogger } from '@ir/logger';
 
-import { startMetricsServer } from './metrics-server';
-import { startWorkers } from './queue';
+import { cfg } from './config';
+import { startWorkers, stopWorkers } from './queue';
 
-async function bootstrap() {
-  const logger = createLogger('playtester');
-  bindUnhandled(logger);
+const logger = createLogger('playtester');
 
-  const runtime = await startWorkers(logger);
-  logger.info('Workers for gen/test queues started');
+async function main() {
+  logger.info(
+    {
+      redisUrl: cfg.redisUrl,
+      prefix: cfg.bullPrefix,
+      genQueue: cfg.genQueue,
+      testQueue: cfg.testQueue,
+    },
+    'Booting playtester workers',
+  );
 
-  const metricsPort = Number.parseInt(process.env.METRICS_PORT ?? '9100', 10);
-  const metricsServer = await startMetricsServer(metricsPort);
-  logger.info({ port: metricsPort }, 'Metrics server listening');
-
-  if (!process.env.OPENAI_API_KEY) {
-    logger.error(
-      'OPENAI_API_KEY is not set. Please configure services/playtester/.env and restart.',
-    );
-    await runtime
-      .close()
-      .catch((error) => logger.error({ err: error }, 'Failed to close runtime after missing API key'));
-    await metricsServer
-      .close()
-      .catch((error) => logger.error({ err: error }, 'Failed to stop metrics server'));
-    process.exit(1);
-  }
+  await startWorkers();
+  logger.info('Playtester workers ready');
 
   let shuttingDown = false;
   const shutdown = async (signal: NodeJS.Signals) => {
@@ -35,37 +27,29 @@ async function bootstrap() {
       return;
     }
     shuttingDown = true;
-    logger.warn({ signal }, 'Received shutdown signal');
+    logger.info({ signal }, 'Received shutdown signal');
     try {
-      await runtime.close();
+      await stopWorkers();
     } catch (error) {
-      logger.error({ err: error }, 'Error during shutdown');
+      logger.error({ err: error }, 'Failed to stop workers cleanly');
+    } finally {
+      process.exit(0);
     }
-    try {
-      await metricsServer.close();
-    } catch (error) {
-      logger.error({ err: error }, 'Failed to close metrics server');
-    }
-    process.exit(0);
   };
 
-  const signals: NodeJS.Signals[] = ['SIGINT', 'SIGTERM'];
-  for (const signal of signals) {
+  (['SIGINT', 'SIGTERM'] as const).forEach((signal) => {
     process.once(signal, () => {
       shutdown(signal).catch((error) => {
-        logger.fatal({ err: error }, 'Shutdown failure');
+        logger.fatal({ err: error }, 'Unexpected shutdown error');
         process.exit(1);
       });
     });
-  }
-}
-
-if (import.meta.url === `file://${process.argv[1]}`) {
-  bootstrap().catch((error) => {
-    const logger = createLogger('playtester');
-    logger.fatal({ err: error }, 'Fatal error during startup');
-    process.exit(1);
   });
 }
 
-export { bootstrap };
+main().catch((error) => {
+  logger.fatal({ err: error }, 'Failed to start playtester workers');
+  stopWorkers()
+    .catch((err) => logger.error({ err }, 'Failed to stop workers after startup failure'))
+    .finally(() => process.exit(1));
+});

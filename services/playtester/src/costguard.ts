@@ -1,27 +1,14 @@
 import { getRedisClient } from './clients';
+import { cfg } from './config';
 
 export interface Usage {
   inputTokens: number;
   outputTokens: number;
 }
 
-const BUDGET_ENV = process.env.BUDGET_USD_PER_DAY;
-
-if (!BUDGET_ENV) {
-  throw new Error('BUDGET_USD_PER_DAY is required for cost guard');
-}
-
-const BUDGET_USD_PER_DAY = Number.parseFloat(BUDGET_ENV);
-if (!Number.isFinite(BUDGET_USD_PER_DAY) || BUDGET_USD_PER_DAY <= 0) {
-  throw new Error('BUDGET_USD_PER_DAY must be a positive number');
-}
-
-const COST_PER_1K_INPUT = Number.parseFloat(process.env.COST_PER_1K_INPUT ?? '0');
-const COST_PER_1K_OUTPUT = Number.parseFloat(process.env.COST_PER_1K_OUTPUT ?? '0');
-
-if (!Number.isFinite(COST_PER_1K_INPUT) || !Number.isFinite(COST_PER_1K_OUTPUT)) {
-  throw new Error('COST_PER_1K_INPUT and COST_PER_1K_OUTPUT must be finite numbers');
-}
+const BUDGET_USD_PER_DAY = Number.isFinite(cfg.budgetUsdPerDay) ? Math.max(cfg.budgetUsdPerDay, 0) : 0;
+const COST_PER_1K_INPUT = Number.isFinite(cfg.costPer1kInput) ? cfg.costPer1kInput : 0;
+const COST_PER_1K_OUTPUT = Number.isFinite(cfg.costPer1kOutput) ? cfg.costPer1kOutput : 0;
 
 function formatKey(date: Date): string {
   const year = date.getFullYear();
@@ -65,6 +52,10 @@ export async function trackAndCheck(
   const ttl = secondsUntilEndOfDay(now);
   if (ttl > 0) {
     await redis.expire(key, ttl);
+  }
+
+  if (BUDGET_USD_PER_DAY <= 0) {
+    return { ok: true, remainingUsd: Number.POSITIVE_INFINITY };
   }
 
   const remaining = Math.max(0, BUDGET_USD_PER_DAY - total);

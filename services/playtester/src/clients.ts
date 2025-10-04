@@ -1,15 +1,16 @@
 import IORedis from 'ioredis';
 import OpenAI from 'openai';
 
+import { cfg } from './config';
+
 const OPENAI_MODEL = process.env.OPENAI_MODEL ?? 'gpt-4.1-mini';
 const OPENAI_REQ_TIMEOUT_MS = Number(process.env.OPENAI_REQ_TIMEOUT_MS ?? '20000');
-const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
 
 let openaiClient: OpenAI | null = null;
 let redisClient: IORedis | null = null;
 
 export function getOpenAIClient(): OpenAI {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = cfg.openaiKey;
   if (!apiKey) {
     throw new Error('OPENAI_API_KEY is not set');
   }
@@ -26,7 +27,7 @@ export function getOpenAIClient(): OpenAI {
 
 export function getRedisClient(): IORedis {
   if (!redisClient) {
-    redisClient = new IORedis(REDIS_URL, {
+    redisClient = new IORedis(cfg.redisUrl, {
       enableOfflineQueue: false,
     });
   }

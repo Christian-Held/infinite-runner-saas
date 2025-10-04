@@ -1,331 +1,313 @@
 import { randomUUID } from 'node:crypto';
 
-import { Ability, getBiome } from '@ir/game-spec';
-import { resolveQueueConfig } from '@ir/queue-config';
-import { Queue, Worker } from 'bullmq';
+import { Ability, Level, type LevelT } from '@ir/game-spec';
+import { createLogger } from '@ir/logger';
+import { Queue, QueueEvents, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { z } from 'zod';
 
-import type { Logger } from '@ir/logger';
-
+import { cfg } from './config';
+import { trackAndCheck } from './costguard';
+import { fetchJson } from './http';
 import { closeGenerator, generateLevel } from './generator';
-import {
-  fetchLevel,
-  ingestLevel,
-  submitLevelMeta,
-  createJobRecord,
-  updateJobStatus,
-  submitLevelPath,
-  submitLevelPatch,
-  submitLevelMetrics,
-  updateSeasonJobStatus,
-} from './internal-client';
-import { testLevel } from './tester';
-import { tune } from './tuner';
 import { scoreLevel } from './scoring';
-import { recordQueueJob } from './metrics';
+import { testLevel } from './tester';
 
-const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
-const queueConfig = resolveQueueConfig({ prefix: process.env.QUEUE_PREFIX });
-const MAX_TUNE_ROUNDS = Number.parseInt(process.env.TUNE_MAX_ROUNDS ?? '3', 10);
+const logger = createLogger('playtester');
 
-const AbilityInputSchema = Ability;
-
-export interface GenJobData {
+interface GenJobData {
+  jobId?: string;
   seed?: string;
   difficulty?: number;
-  abilities?: z.input<typeof AbilityInputSchema>;
-  seasonId?: string;
-  levelNumber?: number;
+  abilities?: z.input<typeof Ability>;
 }
 
-export interface TestJobData {
+interface TestJobData {
   levelId: string;
-  seasonId?: string;
-  levelNumber?: number;
+  jobId: string;
 }
 
-export interface WorkerRuntime {
-  close(): Promise<void>;
+interface WorkerState {
+  connection: IORedis;
+  genQueue: Queue<GenJobData>;
+  testQueue: Queue<TestJobData>;
+  genWorker: Worker<GenJobData, unknown, string>;
+  testWorker: Worker<TestJobData, unknown, string>;
+  genEvents: QueueEvents;
+  testEvents: QueueEvents;
 }
 
-function toErrorMessage(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
+let state: WorkerState | null = null;
+
+function durationMs(started: bigint): number {
+  return Number(process.hrtime.bigint() - started) / 1_000_000;
+}
+
+function ensureKeyPrefix(client: IORedis): void {
+  const target = client as unknown as { options?: Record<string, unknown> };
+  target.options = { ...(target.options ?? {}), keyPrefix: target.options?.keyPrefix ?? '' };
+}
+
+function duplicateConnection(source: IORedis): IORedis {
+  const duplicate = source.duplicate();
+  const decorate = (client: IORedis): IORedis => {
+    ensureKeyPrefix(client);
+    const target = client as unknown as { duplicate?: () => IORedis };
+    if (typeof target.duplicate === 'function') {
+      const original = target.duplicate.bind(client);
+      target.duplicate = () => decorate(original());
+    }
+    return client;
+  };
+  return decorate(duplicate);
+}
+
+async function ensureBudgetAvailable(): Promise<void> {
+  if (!Number.isFinite(cfg.budgetUsdPerDay) || cfg.budgetUsdPerDay <= 0) {
+    return;
   }
-  return typeof error === 'string' ? error : JSON.stringify(error);
+  const status = await trackAndCheck({ inputTokens: 0, outputTokens: 0 });
+  if (!status.ok) {
+    const error = new Error('budget_exceeded');
+    (error as Error & { code?: string }).code = 'budget_exceeded';
+    throw error;
+  }
 }
 
-export async function startWorkers(logger: Logger): Promise<WorkerRuntime> {
-  const connection = new IORedis(REDIS_URL);
-  const queueLogger = logger.child({ module: 'workers', redisUrl: REDIS_URL });
+async function safeUpdateJobStatus(
+  jobId: string,
+  body: { status: 'queued' | 'running' | 'failed' | 'succeeded'; levelId?: string; error?: string | null },
+): Promise<void> {
+  try {
+    await fetchJson({
+      method: 'POST',
+      path: `/internal/jobs/${jobId}/status`,
+      body: {
+        status: body.status,
+        levelId: body.levelId,
+        error: body.error ?? null,
+      },
+      logger,
+    });
+  } catch (error) {
+    logger.error({ err: error, jobId }, 'Failed to update job status');
+  }
+}
 
-  connection.on('error', (error) => {
-    queueLogger.error({ err: error }, 'Redis connection error');
-  });
+async function safeCreateTestJobRecord(params: { jobId: string; levelId: string }): Promise<void> {
+  try {
+    await fetchJson({
+      method: 'POST',
+      path: '/internal/jobs',
+      body: {
+        id: params.jobId,
+        type: 'test',
+        status: 'queued',
+        levelId: params.levelId,
+      },
+      logger,
+    });
+  } catch (error) {
+    logger.error({ err: error, jobId: params.jobId }, 'Failed to create test job record');
+  }
+}
 
-  const genQueue = new Queue<GenJobData>(queueConfig.names[0], {
-    connection,
-    prefix: queueConfig.prefix,
-    defaultJobOptions: { removeOnComplete: true },
-  });
-  const testQueue = new Queue<TestJobData>(queueConfig.names[1], {
-    connection,
-    prefix: queueConfig.prefix,
-    defaultJobOptions: { removeOnComplete: true },
-  });
+export async function startWorkers(): Promise<void> {
+  if (state) {
+    return;
+  }
 
-  queueLogger.info(
+  logger.info(
     {
-      queues: [...queueConfig.names],
-      prefix: queueConfig.prefix,
+      redisUrl: cfg.redisUrl,
+      prefix: cfg.bullPrefix,
+      genQueue: cfg.genQueue,
+      testQueue: cfg.testQueue,
+      genConcurrency: 2,
+      testConcurrency: 4,
     },
     'Starting playtester workers',
   );
 
-  const genWorkerLogger = queueLogger.child({ worker: 'gen' });
-  const testWorkerLogger = queueLogger.child({ worker: 'test' });
+  const connection = new IORedis(cfg.redisUrl, { enableOfflineQueue: false });
+  ensureKeyPrefix(connection);
+  connection.on('error', (error) => {
+    logger.error({ err: error }, 'Redis connection error');
+  });
+
+  const sharedQueueOptions = { connection, prefix: cfg.bullPrefix };
+
+  const genQueue = new Queue<GenJobData>(cfg.genQueue, sharedQueueOptions);
+  const testQueue = new Queue<TestJobData>(cfg.testQueue, sharedQueueOptions);
+  const genEvents = new QueueEvents(cfg.genQueue, {
+    connection: duplicateConnection(connection),
+    prefix: cfg.bullPrefix,
+  });
+  const testEvents = new QueueEvents(cfg.testQueue, {
+    connection: duplicateConnection(connection),
+    prefix: cfg.bullPrefix,
+  });
 
   const genWorker = new Worker<GenJobData>(
-    'gen',
+    cfg.genQueue,
     async (job) => {
-      const jobId = job.id ?? randomUUID();
-      const jobLogger = genWorkerLogger.child({ jobId });
-      const startedAt = process.hrtime.bigint();
-      jobLogger.info({ data: job.data }, 'Generation job started');
+      const started = process.hrtime.bigint();
+      const jobId = typeof job.data?.jobId === 'string' ? job.data.jobId : job.id;
+      const jobLogger = logger.child({ queue: 'gen', jobId });
+
+      jobLogger.info({ data: job.data }, 'GEN job started');
       try {
-        await updateJobStatus({ id: jobId, status: 'running' });
+        await safeUpdateJobStatus(jobId, { status: 'running' });
+        await ensureBudgetAvailable();
 
-        const seed = job.data.seed ?? randomUUID();
-        const difficulty = job.data.difficulty ?? 1;
-        const abilityInput = job.data.abilities ?? { run: true, jump: true };
-        const abilities = AbilityInputSchema.parse(abilityInput);
+        const seed = job.data?.seed ?? job.id;
+        const difficulty = typeof job.data?.difficulty === 'number' ? job.data.difficulty : 1;
+        const abilities = job.data?.abilities;
 
-        if (job.data.seasonId && typeof job.data.levelNumber === 'number') {
-          await updateSeasonJobStatus({
-            seasonId: job.data.seasonId,
-            levelNumber: job.data.levelNumber,
-            status: 'running',
-            jobId,
-          });
-        }
+        const level = await generateLevel(seed, difficulty, abilities, jobLogger);
 
-        const level = await generateLevel(
-          seed,
-          difficulty,
-          abilities,
-          jobLogger,
-          job.data.levelNumber,
-          job.data.seasonId,
-        );
+        const ingest = await fetchJson<{ id: string }>({
+          method: 'POST',
+          path: '/internal/levels',
+          body: {
+            level,
+            meta: { difficulty, seed: level.seed ?? seed },
+          },
+          logger: jobLogger,
+        });
 
-        await ingestLevel({ level, difficulty, seed: level.seed });
-        const levelNumberForMeta = job.data.levelNumber ?? 1;
-        const { biome: biomeName } = getBiome(levelNumberForMeta);
-        await submitLevelMeta({ levelId: level.id, biome: biomeName });
-
-        await updateJobStatus({ id: jobId, status: 'succeeded', levelId: level.id });
-
-        if (job.data.seasonId && typeof job.data.levelNumber === 'number') {
-          await updateSeasonJobStatus({
-            seasonId: job.data.seasonId,
-            levelNumber: job.data.levelNumber,
-            status: 'running',
-            jobId,
-            levelId: level.id,
-          });
-        }
-
+        const levelId = ingest.id;
         const testJobId = randomUUID();
-        await createJobRecord({ id: testJobId, type: 'test', status: 'queued', levelId: level.id });
-        try {
-          await testQueue.add(
-            'playtest',
-            { levelId: level.id, seasonId: job.data.seasonId, levelNumber: job.data.levelNumber },
-            { jobId: testJobId },
-          );
-        } catch (error) {
-          const message = toErrorMessage(error);
-          await updateJobStatus({
-            id: testJobId,
-            status: 'failed',
-            error: message,
-            levelId: level.id,
-          });
-          jobLogger.error({ err: error }, 'Failed to enqueue test job');
-          throw error;
-        }
 
-        const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
-        jobLogger.info({ durationMs, levelId: level.id }, 'Generation job succeeded');
-        recordQueueJob('gen', 'succeeded', startedAt);
+        await safeCreateTestJobRecord({ jobId: testJobId, levelId });
+        await testQueue.add(
+          'test-level',
+          { levelId, jobId: testJobId },
+          { jobId: testJobId },
+        );
+        await safeUpdateJobStatus(jobId, { status: 'succeeded', levelId });
+
+        const duration = durationMs(started);
+        jobLogger.info({ levelId, durationMs: duration }, 'GEN job completed');
+
+        return { levelId, jobId, testJobId };
       } catch (error) {
-        const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
-        jobLogger.error({ err: error, durationMs }, 'Generation job failed');
-        const message = toErrorMessage(error);
-        await updateJobStatus({ id: jobId, status: 'failed', error: message });
-        if (job.data.seasonId && typeof job.data.levelNumber === 'number') {
-          await updateSeasonJobStatus({
-            seasonId: job.data.seasonId,
-            levelNumber: job.data.levelNumber,
-            status: 'failed',
-            jobId,
-          });
-        }
-        recordQueueJob('gen', 'failed', startedAt);
+        const message = error instanceof Error ? error.message : String(error);
+        jobLogger.error({ err: error, durationMs: durationMs(started) }, 'GEN job failed');
+        await safeUpdateJobStatus(jobId, { status: 'failed', error: message });
         throw error;
       }
     },
-    {
-      connection,
-      concurrency: 2,
-    },
+    { connection, concurrency: 2, prefix: cfg.bullPrefix },
   );
 
   const testWorker = new Worker<TestJobData>(
-    'test',
+    cfg.testQueue,
     async (job) => {
-      const jobId = job.id ?? randomUUID();
-      const jobLogger = testWorkerLogger.child({ jobId });
-      const startedAt = process.hrtime.bigint();
-      jobLogger.info({ data: job.data }, 'Test job started');
-      let failedAttempts = 0;
-      let lastReason: string | undefined;
+      const started = process.hrtime.bigint();
+      const jobLogger = logger.child({ queue: 'test', jobId: job.data.jobId });
+      jobLogger.info({ data: job.data }, 'TEST job started');
       try {
-        await updateJobStatus({
-          id: jobId,
+        await safeUpdateJobStatus(job.data.jobId, {
           status: 'running',
           levelId: job.data.levelId,
-          attempts: 0,
         });
 
-        let level = await fetchLevel(job.data.levelId);
-        const maxRounds =
-          Number.isFinite(MAX_TUNE_ROUNDS) && MAX_TUNE_ROUNDS > 0 ? MAX_TUNE_ROUNDS : 3;
+        const level = Level.parse(
+          await fetchJson<LevelT>({
+            path: `/levels/${job.data.levelId}`,
+            logger: jobLogger,
+            internal: false,
+          }),
+        );
 
-        for (let round = 0; round < maxRounds; round += 1) {
-          const result = await testLevel(level, jobLogger);
-          if (result.ok && result.path) {
-            await submitLevelPath({ levelId: job.data.levelId, path: result.path });
-            const finalScore = scoreLevel(level);
-            await submitLevelMetrics({ levelId: job.data.levelId, score: finalScore });
-            await updateJobStatus({
-              id: jobId,
-              status: 'succeeded',
-              levelId: job.data.levelId,
-              attempts: failedAttempts,
-            });
-            if (job.data.seasonId && typeof job.data.levelNumber === 'number') {
-              await updateSeasonJobStatus({
-                seasonId: job.data.seasonId,
-                levelNumber: job.data.levelNumber,
-                status: 'succeeded',
-                levelId: job.data.levelId,
-                jobId,
-              });
-            }
-            jobLogger.info({
-              attempt: round + 1,
-              nodes: result.nodes ?? 0,
-              durationMs: result.durationMs ?? 0,
-            }, 'Test run succeeded');
-            const totalDurationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
-            jobLogger.info({ durationMs: totalDurationMs, attempts: failedAttempts }, 'Test job succeeded');
-            recordQueueJob('test', 'succeeded', startedAt);
-            return;
-          }
-
-          const fail = result.fail ?? {
-            ok: false as const,
-            reason: result.reason ?? 'no_path',
-          };
-
-          failedAttempts += 1;
-          lastReason = fail.reason;
-
-          await updateJobStatus({
-            id: jobId,
-            status: 'running',
-            levelId: job.data.levelId,
-            attempts: failedAttempts,
-            lastReason,
+        const result = await testLevel(level, jobLogger);
+        if (result.ok && result.path) {
+          await fetchJson({
+            method: 'POST',
+            path: '/internal/levels/path',
+            body: { level_id: job.data.levelId, path: result.path },
+            logger: jobLogger,
           });
-
-          jobLogger.warn({
-            attempt: round + 1,
-            nodes: result.nodes ?? 0,
-            durationMs: result.durationMs ?? 0,
-            reason: fail.reason,
-          }, 'Test run failed, attempting tune');
-
-          const tuned = tune(level, fail, jobLogger);
-
-          if (!tuned) {
-            throw new Error(fail.reason);
-          }
-
-          await submitLevelPatch({
-            levelId: job.data.levelId,
-            patch: tuned.patch,
-            reason: fail.reason,
-            level: tuned.patched,
+          const score = scoreLevel(level);
+          await fetchJson({
+            method: 'POST',
+            path: '/internal/levels/metrics',
+            body: { level_id: job.data.levelId, score },
+            logger: jobLogger,
           });
-
-          level = tuned.patched;
+          await safeUpdateJobStatus(job.data.jobId, {
+            status: 'succeeded',
+            levelId: job.data.levelId,
+          });
+          const duration = durationMs(started);
+          jobLogger.info({ durationMs: duration }, 'TEST job completed');
+          return { ok: true, levelId: job.data.levelId };
         }
 
-        throw new Error(lastReason ?? 'no_path');
-      } catch (error) {
-        const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
-        jobLogger.error({ err: error, durationMs, failedAttempts, lastReason }, 'Test job failed');
-        const message = toErrorMessage(error);
-        await updateJobStatus({
-          id: jobId,
+        const reason = result.reason ?? 'test_failed';
+        await safeUpdateJobStatus(job.data.jobId, {
           status: 'failed',
-          error: message,
           levelId: job.data.levelId,
-          attempts: failedAttempts,
-          lastReason,
+          error: reason,
         });
-        if (job.data.seasonId && typeof job.data.levelNumber === 'number') {
-          await updateSeasonJobStatus({
-            seasonId: job.data.seasonId,
-            levelNumber: job.data.levelNumber,
-            status: 'failed',
-            levelId: job.data.levelId,
-            jobId,
-          });
-        }
-        recordQueueJob('test', 'failed', startedAt);
+        const error = new Error(reason);
+        (error as Error & { details?: unknown }).details = result.fail?.details ?? result.details;
+        throw error;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await safeUpdateJobStatus(job.data.jobId, {
+          status: 'failed',
+          levelId: job.data.levelId,
+          error: message,
+        });
+        jobLogger.error({ err: error, durationMs: durationMs(started) }, 'TEST job failed');
         throw error;
       }
     },
-    {
-      connection,
-      concurrency: 4,
-    },
+    { connection, concurrency: 4, prefix: cfg.bullPrefix },
   );
 
-  genWorker.on('failed', (job, error) => {
-    genWorkerLogger.error({ jobId: job?.id, err: error }, 'Generation worker failure event');
+  genWorker.on('failed', (job, err) => {
+    logger.error({ jobId: job?.id, err }, 'GEN worker failure event');
   });
-  testWorker.on('failed', (job, error) => {
-    testWorkerLogger.error({ jobId: job?.id, err: error }, 'Test worker failure event');
+  testWorker.on('failed', (job, err) => {
+    logger.error({ jobId: job?.id, err }, 'TEST worker failure event');
   });
 
-  async function close() {
-    queueLogger.info('Closing playtester workers');
-    await Promise.allSettled([genWorker.close(), testWorker.close()]);
-    await Promise.allSettled([genQueue.close(), testQueue.close()]);
-    try {
-      await connection.quit();
-    } catch (error) {
-      queueLogger.warn({ err: error }, 'Failed to quit Redis connection, forcing disconnect');
-      connection.disconnect();
-    }
-    await closeGenerator();
-    queueLogger.info('Playtester workers closed');
+  state = {
+    connection,
+    genQueue,
+    testQueue,
+    genWorker,
+    testWorker,
+    genEvents,
+    testEvents,
+  };
+}
+
+export async function stopWorkers(): Promise<void> {
+  if (!state) {
+    return;
   }
 
-  return { close };
+  const current = state;
+  state = null;
+
+  logger.info('Stopping playtester workers');
+  await Promise.allSettled([current.genWorker.close(), current.testWorker.close()]);
+  await Promise.allSettled([
+    current.genQueue.close(),
+    current.testQueue.close(),
+    current.genEvents.close(),
+    current.testEvents.close(),
+  ]);
+  try {
+    await current.connection.quit();
+  } catch (error) {
+    logger.warn({ err: error }, 'Failed to quit Redis connection, forcing disconnect');
+    current.connection.disconnect();
+  }
+  await closeGenerator();
+  logger.info('Playtester workers stopped');
 }
